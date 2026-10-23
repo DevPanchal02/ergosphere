@@ -4,11 +4,10 @@ import json
 import time
 from datetime import datetime, timezone
 from collections import defaultdict
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import config
 
-# Strips local user directories and identifies caller OS from raw path structure
 def sanitize_caller(raw: Optional[str]) -> Tuple[str, str]:
     if not raw or not raw.strip():
         return "unknown", "unknown"
@@ -16,7 +15,6 @@ def sanitize_caller(raw: Optional[str]) -> Tuple[str, str]:
     raw_str = raw.strip()
     detected_os = "unknown"
     
-    # Identify host operating system signatures before normalizing slashes
     if re.match(r"^[A-Za-z]:[\\/]", raw_str) or "\\" in raw_str:
         detected_os = "windows"
     elif raw_str.startswith("/Users/"):
@@ -25,24 +23,19 @@ def sanitize_caller(raw: Optional[str]) -> Tuple[str, str]:
         detected_os = "linux"
         
     cleaned = raw_str.replace("\\", "/")
-    
-    # Strip OS-specific home user directory prefixes
     cleaned = re.sub(r"^[A-Za-z]:/(?:Users|home)/[^/]+/", "", cleaned)
     cleaned = re.sub(r"^/(?:Users|home)/[^/]+/", "", cleaned)
     
-    # Anchor to known workspace paths if present
     for anchor in ("event-horizon/", "projects/", ".opencode/"):
         if anchor in cleaned:
             return cleaned[cleaned.index(anchor):], detected_os
             
-    # Fall back to the last 2-3 path segments
     parts = [p for p in cleaned.split("/") if p]
     if len(parts) > 2:
         return "/".join(parts[-3:]), detected_os
         
     return cleaned, detected_os
 
-# Condenses verbose nested SDK exceptions down to clean root causes
 def clean_error_message(msg: str) -> str:
     clean = config.scrub(str(msg))
     if "429" in clean or "ResourceExhausted" in clean:
@@ -56,16 +49,45 @@ def clean_error_message(msg: str) -> str:
     if "503" in clean or "Overloaded" in clean:
         return "503: Service overloaded"
     
-    # Extract inner message text if wrapped in JSON
     m = re.search(r'"message":\s*"([^"]+)"', clean)
     if m:
         return m.group(1)[:120]
     return clean.split("\n")[0][:120]
 
+def row_day(entry: dict) -> Optional[str]:
+    ts_str = entry.get("ts")
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.astimezone(config.TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return ts_str[:10]
+
+def row_timestamp(entry: dict) -> float:
+    ts_str = entry.get("ts")
+    if not ts_str:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+# Finds all diagnostic log files while ignoring the incidents directory
+def get_all_log_files() -> List[str]:
+    found = []
+    for root, dirs, files in os.walk(config.LOGS_DIR):
+        if "incidents" in root:
+            continue
+        for f in files:
+            if f.endswith(".jsonl") or (f.startswith("diagnostics") and not f.endswith(".tmp")):
+                found.append(os.path.join(root, f))
+    return sorted(found)
+
 def get_today_log_path(day_str: str) -> str:
     return os.path.join(config.LOGS_DIR, f"diagnostics_{day_str}.jsonl")
 
-# Writes compact metadata telemetry to today's log partition
 def log_diagnostic(entry: dict):
     day_str = entry.get("ts", "")[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     target_path = get_today_log_path(day_str)
@@ -76,7 +98,6 @@ def log_diagnostic(entry: dict):
     except OSError as e:
         config.log.warning("Could not write diagnostic row: %s", e)
 
-# Dumps the entire request/response payload only when spend or tokens breach incident thresholds
 def capture_incident_payload(rid: str, cost: float, prompt_tokens: int, payload: dict):
     if cost < config.HIGH_COST_THRESHOLD_USD and prompt_tokens < config.HIGH_TOKEN_THRESHOLD:
         return
@@ -94,26 +115,57 @@ def capture_incident_payload(rid: str, cost: float, prompt_tokens: int, payload:
     except OSError as e:
         config.log.warning("Could not save incident payload: %s", e)
 
-# Reads only the requested day's file to avoid slow disk scans across weeks of history
+# Reads all log rows matching a day, with automatic fallback to filename matching
 def read_day_rows(day_str: str) -> list[dict]:
-    target_path = get_today_log_path(day_str)
-    if not os.path.isfile(target_path):
-        return []
-    
     rows = []
-    try:
-        with open(target_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if stripped := line.strip():
-                    try:
-                        rows.append(json.loads(stripped))
-                    except ValueError:
-                        continue
-    except OSError:
-        return []
+    seen_keys = set()
+    all_files = get_all_log_files()
+
+    # Pass 1: Match rows strictly by their recorded timestamp date
+    for path in all_files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if stripped := line.strip():
+                        try:
+                            entry = json.loads(stripped)
+                            if row_day(entry) == day_str:
+                                dedup_key = (entry.get("ts"), entry.get("rid"))
+                                if dedup_key not in seen_keys:
+                                    seen_keys.add(dedup_key)
+                                    rows.append(entry)
+                        except ValueError:
+                            continue
+        except OSError:
+            continue
+
+    # Pass 2 Fallback: If 0 rows matched by timestamp, but a file literally has that date in its name
+    # (like diagnostics_2026-10-17), load the rows from that file directly so it's never empty
+    if not rows:
+        for path in all_files:
+            if day_str in os.path.basename(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if stripped := line.strip():
+                                try:
+                                    entry = json.loads(stripped)
+                                    dedup_key = (entry.get("ts"), entry.get("rid"))
+                                    if dedup_key not in seen_keys:
+                                        seen_keys.add(dedup_key)
+                                        rows.append(entry)
+                                except ValueError:
+                                    continue
+                except OSError:
+                    continue
+
+    rows.sort(key=lambda r: r.get("ts", ""))
     return rows
 
-# Extracts token breakdowns and calculates exact USD cost based on model pricing tables
+def get_rolling_rpm(rows: list[dict], now: float) -> int:
+    cutoff = now - 60.0
+    return sum(1 for r in rows if row_timestamp(r) >= cutoff)
+
 def parse_usage_and_cost(usage_obj: Any, target_model: str) -> dict:
     if not usage_obj:
         return {"in": 0, "c_in": 0, "out": 0, "r_out": 0, "cost": 0.0}
@@ -145,7 +197,6 @@ def parse_usage_and_cost(usage_obj: Any, target_model: str) -> dict:
         "cost": round(cost, 5),
     }
 
-# Aggregates log entries into summary tables for models, callers, and tool rankings
 def summarize_rows(rows: list[dict]) -> Tuple[Dict[str, Any], Dict[str, Any], list[Tuple[str, int]]]:
     by_model = defaultdict(lambda: {"reqs": 0, "usd": 0.0, "in": 0, "cached": 0, "out": 0, "reasoning": 0, "errors": 0})
     by_caller = defaultdict(lambda: {"reqs": 0, "usd": 0.0, "in": 0, "out": 0, "errors": 0, "os": "unknown"})
@@ -153,16 +204,22 @@ def summarize_rows(rows: list[dict]) -> Tuple[Dict[str, Any], Dict[str, Any], li
 
     for r in rows:
         m = r.get("m", "unknown")
-        caller = r.get("caller", "unknown")
-        caller_os = r.get("os", "unknown")
-        is_err = bool(r.get("err"))
+        raw_caller = r.get("caller")
+        if raw_caller and raw_caller != "unknown":
+            caller = raw_caller
+        elif r.get("tool_names"):
+            caller = ",".join(r["tool_names"][:2]) + ("..." if len(r["tool_names"]) > 2 else "")
+        else:
+            caller = f"{r.get('tools_in', 0)} tools"
+
+        caller_os = r.get("os", "agent" if not raw_caller or raw_caller == "unknown" else "?")
+        is_err = bool(r.get("err")) or int(r.get("status") or 200) >= 400
         cost = float(r.get("cost") or 0.0)
         p_in = int(r.get("in") or 0)
         p_cin = int(r.get("c_in") or 0)
         p_out = int(r.get("out") or 0)
         p_rout = int(r.get("r_out") or 0)
 
-        # Model aggregation
         bm = by_model[m]
         bm["reqs"] += 1
         bm["usd"] += cost
@@ -173,7 +230,6 @@ def summarize_rows(rows: list[dict]) -> Tuple[Dict[str, Any], Dict[str, Any], li
         if is_err:
             bm["errors"] += 1
 
-        # Caller attribution
         bc = by_caller[caller]
         bc["reqs"] += 1
         bc["usd"] += cost
@@ -183,7 +239,6 @@ def summarize_rows(rows: list[dict]) -> Tuple[Dict[str, Any], Dict[str, Any], li
         if is_err:
             bc["errors"] += 1
 
-        # Tool calls ranking
         for t in r.get("tools_called") or []:
             tool_counts[t] += 1
 

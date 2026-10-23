@@ -20,7 +20,7 @@ class SpendController:
     def get_today_str(self, ts: float) -> str:
         return datetime.fromtimestamp(ts, config.TZ).strftime("%Y-%m-%d")
 
-    # Read user-defined limits from disk so adjustments stick across restarts
+    # Reads user-configured spending limits from disk so they survive restarts
     def load_limits(self):
         try:
             with open(config.SPEND_FILE, "r", encoding="utf-8") as f:
@@ -31,7 +31,7 @@ class SpendController:
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             pass
 
-    # Save modified limits directly from UI updates without needing container reboots
+    # Saves new caps to disk so live dashboard updates stick across container restarts
     def save_limits(self, daily_usd: float, run_usd: float):
         self.daily_cap = round(daily_usd, 2)
         self.run_cap = round(run_usd, 2)
@@ -42,7 +42,7 @@ class SpendController:
         except OSError as e:
             config.log.warning("Could not persist spend caps to disk: %s", e)
 
-    # Rollover handler for day switches and inactivity periods
+    # Handles date rollovers and resets the run accumulator after idle timeouts
     def _roll(self, now: float):
         current_day = self.get_today_str(now)
         if current_day != self.ledger["day"]:
@@ -51,7 +51,7 @@ class SpendController:
         if self.ledger["run_last"] and (now - self.ledger["run_last"] > config.RUN_IDLE_SECONDS):
             self.ledger.update(run_usd=0.0, run_n=0, run_last=0.0)
 
-    # Stop paid requests if caps are hit; otherwise touch the run clock
+    # Halts paid model requests if spending caps are hit; otherwise updates the active run clock
     def check_spend(self, now: float) -> Optional[str]:
         self._roll(now)
         if self.daily_cap and self.ledger["day_usd"] >= self.daily_cap:
@@ -75,4 +75,12 @@ class SpendController:
     def set_starting_day_spend(self, amount: float):
         self.ledger["day_usd"] = round(amount, 5)
 
+    # Rebuilds today's total spend from disk logs so proxy reboots do not reset caps to zero
+    def preload_spend(self):
+        import analytics
+        rows = analytics.read_day_rows(self.ledger["day"])
+        self.ledger["day_usd"] = round(sum(float(e.get("cost") or 0.0) for e in rows), 4)
+        config.log.info("Preloaded today's spend from disk: $%.4f (%d requests found)", self.ledger["day_usd"], len(rows))
+
 controller = SpendController()
+controller.preload_spend()

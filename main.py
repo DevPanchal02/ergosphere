@@ -132,10 +132,22 @@ async def sse_live_feed(request: Request):
                     yield f"data: {json.dumps(msg)}\n\n"
                 except asyncio.TimeoutError:
                     yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            # Clean exit on Ctrl+C shutdown or client disconnect
+            return
         finally:
             _sse_subscribers.discard(queue)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
 
 # -- core completions proxy --
 @app.post("/v1/chat/completions")
@@ -363,4 +375,7 @@ async def system_status():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "4000")))
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "4000")))
+    except (KeyboardInterrupt, SystemExit):
+        pass

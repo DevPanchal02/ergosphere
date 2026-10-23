@@ -1,5 +1,5 @@
 import os
-import glob
+import re
 import json
 import time
 from datetime import datetime
@@ -10,20 +10,45 @@ import analytics
 from controller import controller
 from key_manager import key_manager
 
-# Scans disk for available diagnostic dates to populate the dropdown
-def get_available_log_days() -> List[str]:
-    files = glob.glob(os.path.join(config.LOGS_DIR, "diagnostics_*.jsonl"))
+# Discovers all dates by inspecting filenames and timestamps inside all log files
+def get_available_log_days() -> List[Dict[str, Any]]:
     days = set()
-    for f in files:
-        base = os.path.basename(f)
-        parts = base.replace(".jsonl", "").split("_")
-        if len(parts) == 2 and len(parts[1]) == 10:
-            days.add(parts[1])
     current_day = controller.get_today_str(time.time())
     days.add(current_day)
-    return sorted(list(days), reverse=True)
+    
+    all_files = analytics.get_all_log_files()
 
-# Formats compact token counts (e.g. 41.5M, 197.5k)
+    # 1. Regex check on filenames
+    for path in all_files:
+        base = os.path.basename(path)
+        if m := re.search(r"\d{4}-\d{2}-\d{2}", base):
+            days.add(m.group(0))
+
+    # 2. Inspect rows inside files so sessions spanning past midnight (like 2026-10-21) are discovered
+    for path in all_files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if stripped := line.strip():
+                        try:
+                            d = json.loads(stripped)
+                            if day := analytics.row_day(d):
+                                days.add(day)
+                        except Exception:
+                            continue
+        except OSError:
+            pass
+
+    # Pre-calculate spend for every discovered day
+    results = []
+    for d in sorted(days, reverse=True):
+        rows = analytics.read_day_rows(d)
+        if not rows and d != current_day:
+            continue
+        cost = sum(float(r.get("cost") or 0.0) for r in rows)
+        results.append({"day": d, "cost": cost, "count": len(rows)})
+    return results
+
 def format_tokens(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"
@@ -31,7 +56,6 @@ def format_tokens(n: int) -> str:
         return f"{n / 1_000:.1f}k"
     return str(n)
 
-# Generates ANSI plaintext summary for curl or terminal inspection
 def render_cli_text(day_str: str) -> str:
     rows = analytics.read_day_rows(day_str)
     by_model, by_caller, ranked_tools = analytics.summarize_rows(rows)
@@ -63,30 +87,45 @@ def render_cli_text(day_str: str) -> str:
 
     return "\n".join(out) + "\n"
 
-# Renders the full self-contained industrial dark-mode HTML dashboard
 def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     now = time.time()
     today_str = controller.get_today_str(now)
     active_day = selected_day or today_str
-    available_days = get_available_log_days()
+    day_entries = get_available_log_days()
 
     rows = analytics.read_day_rows(active_day)
     by_model, by_caller, ranked_tools = analytics.summarize_rows(rows)
     pool_status = key_manager.get_pool_status(now)
 
     total_reqs = len(rows)
-    total_errs = sum(1 for r in rows if r.get("err"))
-    total_prompt = sum(int(r.get("in") or 0) for r in rows)
-    total_cached = sum(int(r.get("c_in") or 0) for r in rows)
-    total_out = sum(int(r.get("out") or 0) for r in rows)
+    total_errs = sum(1 for r in rows if r.get("err") or int(r.get("status") or 200) >= 400)
     total_spend = sum(float(r.get("cost") or 0.0) for r in rows)
+    active_rpm = analytics.get_rolling_rpm(rows, now) if active_day == today_str else 0
 
-    # RPD burn-down tracking across the 8,000 call aggregate pool
-    total_rpd_used = sum(k["rpd_used"] for k in pool_status["keys"])
-    max_rpd_pool = len(pool_status["keys"]) * config.GEMINI_RPD_LIMIT
-    rpd_pct = (total_rpd_used / max(1, max_rpd_pool)) * 100
+    key_cards = []
+    gemini_day_calls = 0
+    for i, (n, _) in enumerate(key_manager.keys):
+        label = f"G{n}"
+        k_rows = [r for r in rows if r.get("key") == label]
+        k_reqs = len(k_rows)
+        gemini_day_calls += k_reqs
+        k_tokens = sum(int(r.get("in") or 0) + int(r.get("out") or 0) for r in k_rows)
+        k_errs = sum(1 for r in k_rows if r.get("err") or int(r.get("status") or 200) >= 400)
+        is_quarantined = key_manager.quarantined[i] if i < len(key_manager.quarantined) else False
+        live_tpm = key_manager.get_tpm_usage(i, now) if active_day == today_str else 0
+
+        key_cards.append({
+            "label": label,
+            "reqs": k_reqs,
+            "tokens": k_tokens,
+            "errs": k_errs,
+            "tpm_used": live_tpm,
+            "quarantined": is_quarantined
+        })
+
+    max_rpd_pool = len(key_manager.keys) * config.GEMINI_RPD_LIMIT
+    rpd_pct = (gemini_day_calls / max(1, max_rpd_pool)) * 100
     
-    # Calculate day progression percentage based on local time
     dt = datetime.fromtimestamp(now, config.TZ)
     seconds_in_day = dt.hour * 3600 + dt.minute * 60 + dt.second
     day_pct = (seconds_in_day / 86400) * 100
@@ -95,8 +134,9 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
     initial_data = {
         "active_day": active_day,
+        "today_str": today_str,
         "rows": rows,
-        "pool": pool_status,
+        "key_cards": key_cards,
         "spend": {
             "day_usd": round(total_spend, 4),
             "daily_cap": controller.daily_cap,
@@ -104,6 +144,23 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
             "run_cap": controller.run_cap
         }
     }
+
+    # Compact button label for the top bar
+    active_button_label = "Today" if active_day == today_str else active_day
+
+    # Dropdown menu items with right-aligned spend
+    dropdown_items_html = []
+    for item in day_entries:
+        d = item["day"]
+        cost_str = f"${item['cost']:.4f}"
+        date_label = "Today" if d == today_str else d
+        is_active = (d == active_day)
+        dropdown_items_html.append(f'''
+          <div class="dropdown-item {'active' if is_active else ''}" onclick="changeDay('{d}')">
+            <span class="d-date">{date_label}</span>
+            <span class="d-cost">{cost_str}</span>
+          </div>
+        ''')
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -126,27 +183,70 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     body {{ background: var(--bg); color: var(--text); padding: 8px; font-size: 13px; line-height: 1.35; }}
 
-    /* Layout structure */
     .top-bar {{ display: flex; align-items: center; justify-content: space-between; background: var(--card); border: 1px solid var(--card-border); padding: 6px 12px; margin-bottom: 8px; border-radius: 4px; }}
     .brand {{ display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--cyan); font-size: 14px; letter-spacing: 0.5px; }}
     .pill {{ padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
     .pill-green {{ background: rgba(16, 185, 129, 0.15); color: var(--green); }}
     .pill-amber {{ background: rgba(245, 158, 11, 0.15); color: var(--amber); }}
     .pill-red {{ background: rgba(239, 68, 68, 0.15); color: var(--red); }}
-    .pill-cyan {{ background: rgba(56, 189, 248, 0.15); color: var(--cyan); }}
+    .pill-muted {{ background: #1e293b; color: var(--text-muted); }}
 
-    .grid {{ display: grid; grid-template-columns: 320px 1fr 340px; gap: 8px; margin-bottom: 8px; }}
+    /* Compact floating dropdown */
+    .dropdown {{ position: relative; display: inline-block; }}
+    .dropdown-trigger {{
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #fff;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+    }}
+    .dropdown-trigger:hover {{ background: #334155; }}
+    .dropdown-menu {{
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      margin-top: 4px;
+      background: #111726;
+      border: 1px solid #1e293b;
+      border-radius: 4px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+      z-index: 1000;
+      min-width: 200px;
+      overflow: hidden;
+    }}
+    .dropdown-menu.show {{ display: block; }}
+    .dropdown-item {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }}
+    .dropdown-item:last-child {{ border-bottom: none; }}
+    .dropdown-item:hover {{ background: rgba(37,99,235,0.25); }}
+    .dropdown-item.active {{ background: rgba(37,99,235,0.45); font-weight: 700; }}
+    .d-date {{ color: var(--text); }}
+    .d-cost {{ color: var(--cyan); font-variant-numeric: tabular-nums; }}
+
+    .grid {{ display: grid; grid-template-columns: 360px 1fr 340px; gap: 8px; margin-bottom: 8px; }}
     .bento-card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; overflow: hidden; }}
     .card-head {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }}
     .card-actions {{ display: flex; align-items: center; gap: 6px; }}
 
-    /* Action buttons */
     .btn-action {{ background: #1e293b; border: 1px solid #334155; color: var(--text); padding: 2px 6px; font-size: 10px; border-radius: 3px; cursor: pointer; }}
     .btn-action:hover {{ background: #334155; }}
     .depth-pills span {{ cursor: pointer; padding: 1px 4px; border-radius: 2px; font-size: 10px; color: var(--text-muted); }}
     .depth-pills span.active {{ background: var(--accent); color: #fff; font-weight: 700; }}
 
-    /* Tables */
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
     th {{ text-align: left; color: var(--text-muted); font-size: 10px; padding: 4px; font-weight: 600; text-transform: uppercase; }}
     td {{ padding: 4px; border-top: 1px solid rgba(255,255,255,0.03); white-space: nowrap; }}
@@ -155,70 +255,72 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .status-err {{ color: var(--red); font-weight: 700; }}
     .mono-num {{ text-align: right; font-variant-numeric: tabular-nums; }}
 
-    /* Key matrix */
     .key-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 4px; }}
-    .key-box {{ background: rgba(0,0,0,0.25); border: 1px solid var(--card-border); padding: 4px; border-radius: 3px; font-size: 10px; }}
+    .key-box {{ background: rgba(0,0,0,0.25); border: 1px solid var(--card-border); padding: 5px; border-radius: 3px; font-size: 10px; }}
     .key-box.quarantined {{ border-color: var(--red); opacity: 0.6; }}
     .key-title {{ display: flex; justify-content: space-between; font-weight: 700; }}
-    .key-bar {{ height: 3px; background: #1e293b; border-radius: 2px; margin-top: 3px; overflow: hidden; }}
-    .key-fill {{ height: 100%; background: var(--green); }}
+    .key-metrics {{ display: flex; justify-content: space-between; color: var(--text-muted); font-size: 9px; margin-top: 2px; }}
 
-    /* Bottom full-width tables */
     .full-width {{ margin-bottom: 8px; }}
-    .scroll-y {{ max-height: 260px; overflow-y: auto; }}
-    .os-badge {{ font-size: 9px; padding: 0 3px; border-radius: 2px; background: #1e293b; color: var(--text-muted); }}
+    .scroll-y {{ max-height: 280px; overflow-y: auto; }}
+    .os-badge {{ font-size: 9px; padding: 0 3px; border-radius: 2px; background: #1e293b; color: var(--text-muted); text-transform: uppercase; }}
   </style>
 </head>
 <body>
 
-  <!-- Top control & header bar -->
   <div class="top-bar">
     <div class="brand">
       <span>⚡ HORIZON PROXY</span>
-      <select id="day-select" style="background:#1e293b; border:1px solid #334155; color:#fff; padding:2px 6px; border-radius:3px; font-size:11px;" onchange="changeDay(this.value)">
-        {''.join(f'<option value="{d}" {"selected" if d == active_day else ""}>{d}</option>' for d in available_days)}
-      </select>
-      <span class="pill pill-green" id="sse-status">● LIVE</span>
+      
+      <!-- Compact trigger button: takes minimal room on the top bar -->
+      <div class="dropdown">
+        <button class="dropdown-trigger" onclick="toggleDropdown(event)">
+          <span>{active_button_label}</span>
+          <span style="font-size:8px; color:var(--text-muted);">▼</span>
+        </button>
+        <!-- Floating menu: opens with date on left and cost on right -->
+        <div class="dropdown-menu" id="day-dropdown">
+          {''.join(dropdown_items_html)}
+        </div>
+      </div>
+
+      <span class="pill" id="sse-status">INITIALIZING</span>
     </div>
 
-    <!-- Fleet gauge metrics -->
     <div style="display:flex; align-items:center; gap:16px; font-size:11px;">
       <div>POOL TPM: <strong style="color:var(--cyan);">{format_tokens(pool_status["pool_tpm_available"])}</strong> / {format_tokens(pool_status["pool_tpm_max"])}</div>
-      <div>POOL RPM: <strong style="color:var(--cyan);">{pool_status["pool_rpm_max"]}</strong></div>
+      <div>RPM: <strong style="color:var(--cyan);">{active_rpm}</strong> / {pool_status["pool_rpm_max"]}</div>
       <div>KEYS: <strong style="color:var(--green);">{pool_status["healthy_keys"]}</strong></div>
-      <div>RPD: <strong>{total_rpd_used:,}</strong> / {max_rpd_pool:,} (<span style="color:{pacing_color}; font-weight:700;">{pacing_status}</span>)</div>
+      <div>RPD: <strong>{gemini_day_calls:,}</strong> / {max_rpd_pool:,} (<span style="color:{pacing_color}; font-weight:700;">{pacing_status}</span>)</div>
       <div style="background:rgba(56,189,248,0.1); border:1px solid rgba(56,189,248,0.3); padding:3px 8px; border-radius:3px;">
         PAID SPEND: <strong style="color:var(--cyan); font-size:12px;">${total_spend:.4f}</strong> <span style="color:var(--text-muted);">/ ${controller.daily_cap:.2f}</span>
       </div>
     </div>
   </div>
 
-  <!-- Primary 3-column bento grid -->
   <div class="grid">
     
-    <!-- Left: 16-key hardware state -->
     <div class="bento-card">
       <div class="card-head">
         <span>Gemini Fleet (16 Keys)</span>
-        <button class="btn-action" onclick="copyCardData('key-table')">Copy</button>
+        <button class="btn-action" onclick="copyCardData('key-grid')">Copy</button>
       </div>
       <div class="key-grid" id="key-grid">
         {''.join(f'''
         <div class="key-box {'quarantined' if k['quarantined'] else ''}">
           <div class="key-title">
             <span style="color:{'var(--red)' if k['quarantined'] else 'var(--green)'};">{k['label']}</span>
-            <span>{k['rpd_used']}/500</span>
+            <span style="color:{'var(--red)' if k['errs'] else 'var(--text-muted)'};">{k['reqs']} reqs</span>
           </div>
-          <div style="color:var(--text-muted); font-size:9px;">TPM: {format_tokens(k['tpm_used'])}</div>
-          <div class="key-bar">
-            <div class="key-fill" style="width:{min(100, int((k['tpm_used'] / max(1, config.GEMINI_TPM_LIMIT)) * 100))}%; background:{'var(--red)' if k['tpm_used'] > 200000 else 'var(--green)'};"></div>
+          <div class="key-metrics">
+            <span>{format_tokens(k['tokens'])}</span>
+            <span style="color:{'var(--red)' if k['errs'] else 'inherit'};">{k['errs']} errs</span>
           </div>
         </div>
-        ''' for k in pool_status["keys"])}
+        ''' for k in key_cards)}
       </div>
     </div>
 
-    <!-- Center: Model breakdown -->
     <div class="bento-card">
       <div class="card-head">
         <span>Model Breakdown</span>
@@ -252,7 +354,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       </table>
     </div>
 
-    <!-- Right: Ranked tool calls -->
     <div class="bento-card">
       <div class="card-head">
         <span>Ranked Tool Invocations</span>
@@ -282,7 +383,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
   </div>
 
-  <!-- Bottom: Requests & Errors Tables -->
   <div class="bento-card full-width">
     <div class="card-head">
       <div style="display:flex; align-items:center; gap:12px;">
@@ -313,7 +413,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
           </tr>
         </thead>
         <tbody id="req-tbody">
-          <!-- Populated by JavaScript -->
         </tbody>
       </table>
     </div>
@@ -347,7 +446,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
           </tr>
         </thead>
         <tbody id="err-tbody">
-          <!-- Populated by JavaScript -->
         </tbody>
       </table>
     </div>
@@ -356,6 +454,17 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
   <script>
     const INITIAL_DATA = {json.dumps(initial_data)};
     let depthConfig = {{ req: 8, err: 8 }};
+
+    function toggleDropdown(e) {{
+      e.stopPropagation();
+      const menu = document.getElementById("day-dropdown");
+      menu.classList.toggle("show");
+    }}
+
+    window.addEventListener("click", () => {{
+      const menu = document.getElementById("day-dropdown");
+      if (menu) menu.classList.remove("show");
+    }});
 
     function changeDay(day) {{
       window.location.href = window.location.pathname + "?day=" + day;
@@ -369,19 +478,28 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       renderTables();
     }}
 
+    function getCallerLabel(r) {{
+      if (r.caller && r.caller !== 'unknown') {{
+        return `<span class="os-badge">${{r.os || '?'}}</span> ${{r.caller}}`;
+      }}
+      if (r.tool_names && r.tool_names.length) {{
+        return `<span class="os-badge">agent</span> ${{r.tool_names.slice(0, 2).join(',')}}${{r.tool_names.length > 2 ? '...' : ''}}`;
+      }}
+      return `<span class="os-badge">prompt</span> ${{r.tools_in || 0}} tools`;
+    }}
+
     function renderTables() {{
       const rows = INITIAL_DATA.rows || [];
       const reqTbody = document.getElementById("req-tbody");
       const errTbody = document.getElementById("err-tbody");
 
-      // Render requests
       const recentReqs = rows.slice(-depthConfig.req).reverse();
       reqTbody.innerHTML = recentReqs.length ? recentReqs.map(r => `
         <tr>
           <td style="color:var(--text-muted);">${{(r.ts || '').substring(11, 19)}}Z</td>
           <td class="${{r.status < 400 ? 'status-ok' : 'status-err'}}">${{r.status || 200}}</td>
           <td>${{(r.m || '').split('/').pop()}}</td>
-          <td><span class="os-badge">${{r.os || '?'}}</span> ${{r.caller || 'unknown'}}</td>
+          <td>${{getCallerLabel(r)}}</td>
           <td><strong style="color:var(--green);">${{r.key || '-'}}</strong></td>
           <td class="mono-num">${{(r.in || 0).toLocaleString()}} <span style="color:var(--text-muted); font-size:10px;">(${{(r.c_in || 0).toLocaleString()}})</span></td>
           <td class="mono-num">${{(r.out || 0).toLocaleString()}}</td>
@@ -390,7 +508,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </tr>
       `).join('') : '<tr><td colspan="9" style="text-align:center; color:var(--text-muted);">No requests</td></tr>';
 
-      // Render errors
       const errRows = rows.filter(r => r.err || r.status >= 400);
       const recentErrs = errRows.slice(-depthConfig.err).reverse();
       errTbody.innerHTML = recentErrs.length ? recentErrs.map(r => `
@@ -398,7 +515,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
           <td style="color:var(--text-muted);">${{(r.ts || '').substring(11, 19)}}Z</td>
           <td class="status-err">${{r.status || 500}}</td>
           <td>${{(r.m || '').split('/').pop()}}</td>
-          <td><span class="os-badge">${{r.os || '?'}}</span> ${{r.caller || 'unknown'}}</td>
+          <td>${{getCallerLabel(r)}}</td>
           <td><strong style="color:var(--red);">${{r.key || '-'}}</strong></td>
           <td style="color:var(--red);">${{r.err || 'Unknown Error'}}</td>
           <td class="mono-num">${{r.dur || 0}}s</td>
@@ -406,25 +523,45 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       `).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No errors recorded</td></tr>';
     }}
 
-    // Formats any table on screen into compact Markdown and copies it to clipboard
-    function copyCardData(tableId) {{
-      const table = document.getElementById(tableId);
-      if (!table) return;
-      let text = `[TABLE:${{tableId.toUpperCase()}}]\n`;
-      const rows = table.querySelectorAll("tr");
-      rows.forEach(r => {{
-        const cells = Array.from(r.querySelectorAll("th, td")).map(c => c.innerText.replace(/\\n/g, ' ').trim());
-        if (cells.length) text += cells.join(" | ") + "\\n";
-      }});
+    function copyCardData(elementId) {{
+      const el = document.getElementById(elementId);
+      if (!el) return;
+      let text = `[EXPORT:${{elementId.toUpperCase()}}]\n`;
+      const rows = el.querySelectorAll("tr");
+      if (rows.length) {{
+        rows.forEach(r => {{
+          const cells = Array.from(r.querySelectorAll("th, td")).map(c => c.innerText.replace(/\\n/g, ' ').trim());
+          if (cells.length) text += cells.join(" | ") + "\\n";
+        }});
+      }} else {{
+        el.querySelectorAll(".key-box").forEach(k => {{
+          text += k.innerText.replace(/\\n/g, ' | ') + "\\n";
+        }});
+      }}
       navigator.clipboard.writeText(text).then(() => {{
-        alert("Copied table as token-efficient markdown!");
+        alert("Copied to clipboard!");
       }});
     }}
 
-    // Connect to Server-Sent Events stream for live dynamic updates
-    function initSSE() {{
+    function setupStatusAndSSE() {{
       const statusEl = document.getElementById("sse-status");
+      const isToday = (INITIAL_DATA.active_day === INITIAL_DATA.today_str);
+
+      if (!isToday) {{
+        statusEl.textContent = "ARCHIVED";
+        statusEl.className = "pill pill-muted";
+        return;
+      }}
+
+      statusEl.textContent = "○ PENDING";
+      statusEl.className = "pill pill-amber";
+
       const es = new EventSource("/api/live");
+
+      es.onopen = () => {{
+        statusEl.textContent = "● LIVE";
+        statusEl.className = "pill pill-green";
+      }};
 
       es.onmessage = (event) => {{
         try {{
@@ -438,15 +575,18 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       }};
 
       es.onerror = () => {{
-        if (statusEl) {{
-          statusEl.textContent = "○ POLLING";
+        if (es.readyState === EventSource.CONNECTING) {{
+          statusEl.textContent = "○ PENDING";
           statusEl.className = "pill pill-amber";
+        }} else {{
+          statusEl.textContent = "✕ OFFLINE";
+          statusEl.className = "pill pill-red";
         }}
       }};
     }}
 
     renderTables();
-    initSSE();
+    setupStatusAndSSE();
   </script>
 </body>
 </html>
