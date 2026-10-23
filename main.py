@@ -75,6 +75,7 @@ async def health():
     return JSONResponse(status_code=200, content={
         "status": "healthy",
         "keys_healthy": f"{healthy_count}/{key_manager.num_keys}",
+        "keys_alive": f"{healthy_count}/{key_manager.num_keys}",
         "tpm_available": pool["pool_tpm_available"],
         "openrouter_configured": bool(config.OPENROUTER_KEY),
         "spend_capped": spend_blocked,
@@ -259,7 +260,17 @@ async def chat_completions(request: Request):
                 )
             except RuntimeError as ex:
                 finish_gemini()
-                raise HTTPException(status_code=503, detail=str(ex))
+                err_msg = str(ex)
+                duration = round(time.time() - t0, 2)
+                diag_row = {
+                    "ts": now_iso(), "rid": rid, "m": model, "caller": caller_path, "os": caller_os,
+                    "key": "DEAD", "status": 503, "dur": duration, "in": 0, "c_in": 0,
+                    "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
+                    "tools_called": [], "err": err_msg
+                }
+                analytics.log_diagnostic(diag_row)
+                asyncio.create_task(broadcast_live_event("telemetry", diag_row))
+                return JSONResponse(status_code=503, content={"error": {"message": err_msg, "type": "FleetExhausted"}})
 
             gemini_key_label = key_label
             target_backend_model = config.FALLBACK_GEMINI_MODEL if (use_fallback or model == "gemini-3.1-flash-lite") else config.PRIMARY_GEMINI_MODEL
@@ -411,8 +422,13 @@ async def dashboard_view(request: Request, day: Optional[str] = None):
     if fmt == "json":
         rows = analytics.read_day_rows(target_day)
         by_model, by_caller, by_agent, ranked_tools = analytics.summarize_rows(rows)
+        available_days = [item["day"] for item in dashboard.get_available_log_days()]
         return {
             "day": target_day,
+            "tz": config.TZ_NOTE,
+            "day_usd": round(controller.ledger["day_usd"], 4),
+            "daily_cap": controller.daily_cap,
+            "available_days": available_days,
             "spend": {
                 "day_usd": round(controller.ledger["day_usd"], 4),
                 "daily_cap": controller.daily_cap,
@@ -421,6 +437,8 @@ async def dashboard_view(request: Request, day: Optional[str] = None):
             },
             "by_model": by_model,
             "by_caller": by_caller,
+            "by_agent": by_agent,
+            "tool_calls_ranked": ranked_tools,
             "top_tools": ranked_tools,
             "pool": key_manager.get_pool_status(time.time())
         }

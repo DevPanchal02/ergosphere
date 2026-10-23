@@ -54,19 +54,35 @@ def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[s
                     return role, detected_os
 
     if raw_caller and raw_caller != client_host:
-        cleaned = raw_caller.replace("\\", "/")
-        cleaned = re.sub(r"^[A-Za-z]:/(?:Users|home)/[^/]+/", "", cleaned)
-        cleaned = re.sub(r"^/(?:Users|home)/[^/]+/", "", cleaned)
+        sanitized_path, path_os = sanitize_caller(raw_caller)
+        if detected_os == "unknown" and path_os != "unknown":
+            detected_os = path_os
+        return sanitized_path, detected_os
 
-        for anchor in ("event-horizon/", "projects/", ".opencode/", "workspace/", "repos/"):
-            if anchor in cleaned:
-                return cleaned[cleaned.index(anchor):], detected_os
+    return "agent", detected_os
 
-        parts = [p for p in cleaned.split("/") if p]
-        if len(parts) > 2:
-            return "/".join(parts[-3:]), detected_os
-        if cleaned:
-            return cleaned, detected_os
+def sanitize_caller(raw_caller: str) -> Tuple[str, str]:
+    detected_os = "unknown"
+    if re.match(r"^[A-Za-z]:[\\/]", raw_caller) or "\\" in raw_caller:
+        detected_os = "windows"
+    elif raw_caller.startswith("/Users/"):
+        detected_os = "macos"
+    elif raw_caller.startswith(("/home/", "/root/")):
+        detected_os = "linux"
+
+    cleaned = raw_caller.replace("\\", "/")
+    cleaned = re.sub(r"^[A-Za-z]:/(?:Users|home)/[^/]+/", "", cleaned)
+    cleaned = re.sub(r"^/(?:Users|home)/[^/]+/", "", cleaned)
+
+    for anchor in ("event-horizon/", "projects/", ".opencode/", "workspace/", "repos/"):
+        if anchor in cleaned:
+            return cleaned[cleaned.index(anchor):], detected_os
+
+    parts = [p for p in cleaned.split("/") if p]
+    if len(parts) > 2:
+        return "/".join(parts[-3:]), detected_os
+    if cleaned:
+        return cleaned, detected_os
 
     return "agent", detected_os
 
