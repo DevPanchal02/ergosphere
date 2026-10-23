@@ -20,7 +20,6 @@ class SpendController:
     def get_today_str(self, ts: float) -> str:
         return datetime.fromtimestamp(ts, config.TZ).strftime("%Y-%m-%d")
 
-    # Reads user-configured spending limits from disk so they survive restarts
     def load_limits(self):
         try:
             with open(config.SPEND_FILE, "r", encoding="utf-8") as f:
@@ -31,7 +30,6 @@ class SpendController:
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             pass
 
-    # Saves new caps to disk so live dashboard updates stick across container restarts
     def save_limits(self, daily_usd: float, run_usd: float):
         self.daily_cap = round(daily_usd, 2)
         self.run_cap = round(run_usd, 2)
@@ -42,7 +40,6 @@ class SpendController:
         except OSError as e:
             config.log.warning("Could not persist spend caps to disk: %s", e)
 
-    # Handles date rollovers and resets the run accumulator after idle timeouts
     def _roll(self, now: float):
         current_day = self.get_today_str(now)
         if current_day != self.ledger["day"]:
@@ -51,13 +48,12 @@ class SpendController:
         if self.ledger["run_last"] and (now - self.ledger["run_last"] > config.RUN_IDLE_SECONDS):
             self.ledger.update(run_usd=0.0, run_n=0, run_last=0.0)
 
-    # Halts paid model requests if spending caps are hit; otherwise updates the active run clock
     def check_spend(self, now: float) -> Optional[str]:
         self._roll(now)
         if self.daily_cap and self.ledger["day_usd"] >= self.daily_cap:
             return (f"Daily spend cap ${self.daily_cap:.2f} reached (${self.ledger['day_usd']:.2f} spent today). "
                     f"Resets at midnight ({config.TZ_NOTE}), or adjust limit in dashboard.")
-        
+
         if self.run_cap and self.ledger["run_usd"] >= self.run_cap:
             return (f"Run spend cap ${self.run_cap:.2f} reached (${self.ledger['run_usd']:.2f} this run, {self.ledger['run_n']} reqs). "
                     f"Resets after {config.RUN_IDLE_SECONDS / 60:.0f}m idle.")
@@ -72,10 +68,6 @@ class SpendController:
         self.ledger["run_n"] += 1
         self.ledger["run_last"] = now
 
-    def set_starting_day_spend(self, amount: float):
-        self.ledger["day_usd"] = round(amount, 5)
-
-    # Rebuilds today's total spend from disk logs so proxy reboots do not reset caps to zero
     def preload_spend(self):
         import analytics
         rows = analytics.read_day_rows(self.ledger["day"])

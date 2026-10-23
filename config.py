@@ -27,6 +27,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 INCIDENTS_DIR = os.path.join(LOGS_DIR, "incidents")
 SPEND_FILE = os.path.join(LOGS_DIR, "spend_limits.json")
+RUNTIME_SETTINGS_FILE = os.path.join(LOGS_DIR, "runtime_settings.json")
 
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(INCIDENTS_DIR, exist_ok=True)
@@ -57,6 +58,7 @@ def scrub(text: str) -> str:
     return _KEY_PATTERNS.sub("***", text)
 
 # -- pricing and routing --
+# (uncached_in, cached_in, out) per 1M tokens
 PRICING = {
     "openrouter/xiaomi/mimo-v2.6-pro": (0.435, 0.00435, 0.87),
     "openrouter/openai/gpt-6.1-sol":    (2.00,  0.10,    10.00),
@@ -80,21 +82,21 @@ RUN_IDLE_SECONDS = float(os.getenv("RUN_IDLE_SECONDS", "900"))
 LOCAL_TZ = os.getenv("TIMEZONE", os.getenv("BUDGET_TZ", "America/Toronto"))
 MAX_OUT_TOKENS = int(os.getenv("MAX_OUT_TOKENS", "32000"))
 
+# Default Gemini 3.5 / 3.1 Flash-Lite Limits
 GEMINI_RPM_LIMIT = int(os.getenv("GEMINI_KEY_RPM", "15"))
 GEMINI_TPM_LIMIT = int(os.getenv("GEMINI_KEY_TPM", "250000"))
 GEMINI_RPD_LIMIT = int(os.getenv("GEMINI_KEY_RPD", "500"))
+GEMINI_PARALLEL = int(os.getenv("GEMINI_PARALLEL", "0"))  # 0 = unthrottled
 TPM_WINDOW_SECONDS = 60.0
 
 HIGH_COST_THRESHOLD_USD = float(os.getenv("HIGH_COST_THRESHOLD_USD", "0.05"))
 HIGH_TOKEN_THRESHOLD = int(os.getenv("HIGH_TOKEN_THRESHOLD", "150000"))
 
-# Timezone resolution with native host fallback on Windows
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo(LOCAL_TZ)
     TZ_NOTE = LOCAL_TZ
 except Exception:
-    # Use Windows system local timezone (EDT / Toronto) so local late nights don't roll into tomorrow
     system_tz = datetime.now().astimezone().tzinfo
     TZ = system_tz if system_tz else timezone.utc
     TZ_NOTE = f"{LOCAL_TZ} (system)"
