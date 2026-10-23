@@ -73,9 +73,10 @@ def render_cli_text(day_str: str) -> str:
         fb_str = "[3.1]" if k["fallback"] else "[3.5]"
         out.append(f"  {k['label']:<4} {fb_str} [{k['status_text']:<8}] RPM={k['rpm_used']}/15 TPM={format_tokens(k['tpm_used'])}/{format_tokens(k['tpm_limit'])} RPD={k['rpd_used']}/500 Errs={k['errs']}")
 
-    out.append("\n--- CALLERS & AGENT ROLES ---")
+    out.append("\n--- CALLERS & AGENTS ---")
     for c, b in sorted(by_caller.items(), key=lambda x: x[1]["usd"], reverse=True):
-        out.append(f"  {c:<32} [{b.get('os','?')}] reqs={b['reqs']:<5} ${b['usd']:<7.4f} in={format_tokens(b['in'])}")
+        fail_pct = (b['errors'] / b['reqs'] * 100) if b['reqs'] else 0.0
+        out.append(f"  {c:<30} [{b.get('os','?')}] reqs={b['reqs']:<5} fail={fail_pct:4.1f}% ${b['usd']:<7.4f} in={format_tokens(b['in'])}")
 
     out.append("\n--- MODELS BREAKDOWN ---")
     for m, b in sorted(by_model.items(), key=lambda x: x[1]["reqs"], reverse=True):
@@ -161,7 +162,8 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     body {{ background: var(--bg); color: var(--text); padding: 8px; font-size: 13px; line-height: 1.35; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
 
-    .top-bar {{ display: flex; align-items: center; justify-content: space-between; background: var(--card); border: 1px solid var(--card-border); padding: 6px 12px; margin-bottom: 8px; border-radius: 4px; }}
+    /* Exact Original Top Bar */
+    .top-bar {{ display: flex; align-items: center; justify-content: space-between; background: var(--card); border: 1px solid var(--card-border); padding: 6px 12px; margin-bottom: 8px; border-radius: 4px; flex-shrink: 0; }}
     .brand {{ display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--cyan); font-size: 14px; letter-spacing: 0.5px; }}
     .pill {{ padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
     .pill-green {{ background: rgba(16, 185, 129, 0.15); color: var(--green); }}
@@ -214,23 +216,26 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .d-date {{ color: var(--text); }}
     .d-cost {{ color: var(--cyan); font-variant-numeric: tabular-nums; }}
 
+    /* Layout: Left Sidebar + Right Main Workspace */
     .cockpit-layout {{
       display: grid;
       grid-template-columns: 380px 1fr;
       gap: 8px;
       flex: 1;
       min-height: 0;
+      height: calc(100vh - 54px);
     }}
     @media (max-width: 1150px) {{
-      .cockpit-layout {{ grid-template-columns: 1fr; }}
+      .cockpit-layout {{ grid-template-columns: 1fr; height: auto; }}
       body {{ overflow-y: auto; height: auto; }}
     }}
 
-    .bento-card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 4px; padding: 7px; display: flex; flex-direction: column; }}
-    .card-head {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; padding-bottom: 3px; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }}
+    .bento-card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 4px; padding: 7px; display: flex; flex-direction: column; min-height: 0; }}
+    .card-head {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; padding-bottom: 3px; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; }}
     .btn-action {{ background: #1e293b; border: 1px solid #334155; color: var(--text); padding: 2px 6px; font-size: 10px; border-radius: 3px; cursor: pointer; }}
     .btn-action:hover {{ background: #334155; }}
 
+    /* Scheduler Logic Box */
     .balancer-card {{
       background: rgba(0, 0, 0, 0.4);
       border: 1px solid #1e293b;
@@ -238,17 +243,20 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       padding: 5px 8px;
       margin-bottom: 6px;
       font-size: 11px;
+      flex-shrink: 0;
     }}
     .bal-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; }}
     .bal-title {{ color: var(--text-muted); font-size: 9.5px; font-weight: 700; text-transform: uppercase; }}
     .bal-val {{ font-weight: 700; color: #fff; font-size: 11px; }}
 
+    /* Left Fleet Column */
     .fleet-grid {{
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 5px;
       flex: 1;
       overflow-y: auto;
+      min-height: 0;
     }}
     .key-card {{
       background: rgba(0,0,0,0.25);
@@ -282,12 +290,14 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .tpm-track {{ background: #162035; height: 3px; border-radius: 2px; overflow: hidden; margin-top: 3px; }}
     .tpm-bar {{ height: 100%; }}
 
+    /* Main Right Workspace - Full Height Flex Layout */
     .main-workspace {{
       display: flex;
       flex-direction: column;
       gap: 8px;
-      overflow-y: auto;
+      flex: 1;
       min-height: 0;
+      height: 100%;
     }}
     .grid-2col {{ display: grid; grid-template-columns: 1.25fr 1fr; gap: 8px; }}
 
@@ -299,8 +309,9 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .status-ok {{ color: var(--green); font-weight: 700; }}
     .status-err {{ color: var(--red); font-weight: 700; }}
 
+    /* Depth Input */
     .depth-sync-input {{
-      width: 48px;
+      width: 44px;
       background: #141d2f;
       border: 1px solid #334155;
       color: var(--cyan);
@@ -311,13 +322,21 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       text-align: center;
       outline: none;
     }}
-    .scroll-y {{ max-height: 180px; overflow-y: auto; }}
+    .depth-sync-input:focus {{ border-color: var(--cyan); }}
+
+    /* Table Container That Takes Up Entire Vertical Space Without Awkward Fixed Heights */
+    .table-fill {{
+      flex: 1;
+      overflow-y: auto;
+      min-height: 0;
+      height: 100%;
+    }}
     .os-badge {{ font-size: 9px; padding: 0 4px; border-radius: 2px; background: #1e293b; color: var(--cyan); text-transform: uppercase; font-weight: 700; }}
   </style>
 </head>
 <body>
 
-  <!-- Exact Modular Top Bar -->
+  <!-- Top Bar -->
   <div class="top-bar">
     <div class="brand">
       <span>⚡ HORIZON PROXY</span>
@@ -348,14 +367,14 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
   <div class="cockpit-layout">
     
-    <!-- LEFT SIDEBAR: EXPANDED 2-COLUMN FLEET (FITS ON ONE SCREEN) -->
+    <!-- LEFT SIDEBAR: EXPANDED 2-COLUMN FLEET -->
     <aside class="bento-card" style="height: 100%;">
       <div class="card-head">
         <span>Gemini Fleet ({len(key_manager.keys)} Keys)</span>
         <button class="btn-action" onclick="copyCardData('fleet-box', this)">Copy</button>
       </div>
 
-      <!-- Transparent Scheduler Logic Box -->
+      <!-- Scheduler Telemetry Box -->
       <div class="balancer-card">
         <div class="bal-row">
           <span class="bal-title">EQUATION</span>
@@ -367,16 +386,14 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <div class="fleet-grid" id="fleet-box">
-        <!-- Dynamically rendered 2-column cards -->
-      </div>
+      <div class="fleet-grid" id="fleet-box"></div>
     </aside>
 
     <!-- RIGHT MAIN: MODELS, CALLERS, REQUESTS & ERRORS SIDE-BY-SIDE -->
     <main class="main-workspace">
       
-      <!-- Row 1: Models & Ranked Tools -->
-      <div class="grid-2col">
+      <!-- Row 1: Models & Ranked Tools (Compact) -->
+      <div class="grid-2col" style="flex-shrink: 0;">
         <div class="bento-card">
           <div class="card-head">
             <span>Models Breakdown</span>
@@ -417,19 +434,20 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <!-- Row 2: Callers & Specific Agent Roles -->
-      <div class="bento-card">
+      <!-- Row 2: Callers & Agents (Normalized Title + Fail Rate Column) -->
+      <div class="bento-card" style="flex-shrink: 0; max-height: 140px;">
         <div class="card-head">
-          <span>Callers & Agent Roles (Builder / Scout / Planner / Path)</span>
+          <span>Callers & Agents</span>
           <button class="btn-action" onclick="copyCardData('caller-table', this)">Copy</button>
         </div>
-        <div class="scroll-y" style="max-height: 120px;">
+        <div class="table-fill">
           <table id="caller-table">
             <thead>
               <tr>
-                <th>Agent ID / Path</th>
+                <th>Caller / Agent ID</th>
                 <th>Platform</th>
                 <th class="mono-num">Requests</th>
+                <th class="mono-num">Fail Rate</th>
                 <th class="mono-num">Spend</th>
                 <th class="mono-num">Tokens In</th>
                 <th class="mono-num">Tokens Out</th>
@@ -441,20 +459,20 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <!-- Row 3: Requests & Errors Side-by-Side with Synchronized Custom Depth -->
+      <!-- Row 3: Requests & Errors Side-by-Side (Fills Entire Remaining Space) -->
       <div class="grid-2col" style="flex: 1; min-height: 0;">
         
         <!-- Recent Requests -->
-        <div class="bento-card" style="flex: 1;">
+        <div class="bento-card" style="height: 100%;">
           <div class="card-head">
             <div style="display:flex; align-items:center; gap:8px;">
               <span>Recent Requests</span>
               <span style="font-size:10px; color:var(--text-muted);">DEPTH:</span>
-              <input type="number" class="depth-sync-input" id="global-depth-input" value="15" min="1" max="500" onchange="syncDepth(this.value)">
+              <input type="number" class="depth-sync-input" id="req-depth-input" value="15" min="1" max="500" oninput="setDepth('req', this.value)">
             </div>
             <button class="btn-action" onclick="copyCardData('req-table', this)">Copy</button>
           </div>
-          <div class="scroll-y" style="max-height: 220px;">
+          <div class="table-fill">
             <table id="req-table">
               <thead>
                 <tr>
@@ -473,12 +491,16 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
 
         <!-- Recent Errors -->
-        <div class="bento-card" style="flex: 1;">
+        <div class="bento-card" style="height: 100%;">
           <div class="card-head">
-            <span style="color:var(--red);">Recent Errors</span>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="color:var(--red);">Recent Errors</span>
+              <span style="font-size:10px; color:var(--text-muted);">DEPTH:</span>
+              <input type="number" class="depth-sync-input" id="err-depth-input" value="15" min="1" max="500" oninput="setDepth('err', this.value)">
+            </div>
             <button class="btn-action" onclick="copyCardData('err-table', this)">Copy</button>
           </div>
-          <div class="scroll-y" style="max-height: 220px;">
+          <div class="table-fill">
             <table id="err-table">
               <thead>
                 <tr>
@@ -503,7 +525,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
   <script>
     const INITIAL_DATA = {json.dumps(initial_payload)};
-    let currentDepth = 15;
+    let depthConfig = {{ req: 15, err: 15 }};
 
     function toggleDropdown(e) {{
       e.stopPropagation();
@@ -525,11 +547,11 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       return num.toLocaleString();
     }}
 
-    function syncDepth(val) {{
+    // Real-time custom depth handling on keystroke
+    function setDepth(type, val) {{
       const parsed = parseInt(val);
-      if (parsed > 0) {{
-        currentDepth = parsed;
-        document.getElementById("global-depth-input").value = parsed;
+      if (!isNaN(parsed) && parsed > 0) {{
+        depthConfig[type] = Math.min(500, Math.max(1, parsed));
         renderRequestsAndErrors();
       }}
     }}
@@ -641,20 +663,25 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </tr>
       `).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No activity</td></tr>';
 
-      // Callers Table
+      // Callers & Agents Table (Normalized + Fail Rate)
       const callerTbody = document.getElementById("caller-tbody");
       const callerKeys = Object.keys(byCaller).sort((a,b) => byCaller[b].reqs - byCaller[a].reqs);
-      callerTbody.innerHTML = callerKeys.length ? callerKeys.map(c => `
-        <tr>
-          <td style="font-weight:700; color:var(--text);">${{c}}</td>
-          <td><span class="os-badge">${{byCaller[c].os}}</span></td>
-          <td class="mono-num">${{byCaller[c].reqs.toLocaleString()}}</td>
-          <td class="mono-num">$${{byCaller[c].usd.toFixed(4)}}</td>
-          <td class="mono-num">${{formatTok(byCaller[c].in)}}</td>
-          <td class="mono-num">${{formatTok(byCaller[c].out)}}</td>
-          <td class="mono-num" style="color:${{byCaller[c].errs ? 'var(--red)' : 'inherit'}};">${{byCaller[c].errs}}</td>
-        </tr>
-      `).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No active callers</td></tr>';
+      callerTbody.innerHTML = callerKeys.length ? callerKeys.map(c => {{
+        const b = byCaller[c];
+        const failRate = b.reqs ? ((b.errs / b.reqs) * 100).toFixed(1) : '0.0';
+        return `
+          <tr>
+            <td style="font-weight:700; color:var(--text);">${{c}}</td>
+            <td><span class="os-badge">${{b.os}}</span></td>
+            <td class="mono-num">${{b.reqs.toLocaleString()}}</td>
+            <td class="mono-num" style="color:${{parseFloat(failRate) > 0 ? 'var(--red)' : 'var(--text-muted)'}}; font-weight:${{parseFloat(failRate) > 0 ? '700' : 'normal'}};">${{failRate}}%</td>
+            <td class="mono-num">$${{b.usd.toFixed(4)}}</td>
+            <td class="mono-num">${{formatTok(b.in)}}</td>
+            <td class="mono-num">${{formatTok(b.out)}}</td>
+            <td class="mono-num" style="color:${{b.errs ? 'var(--red)' : 'inherit'}};">${{b.errs}}</td>
+          </tr>
+        `;
+      }}).join('') : '<tr><td colspan="8" style="text-align:center; color:var(--text-muted);">No active callers</td></tr>';
 
       // Tools Table
       const toolTbody = document.getElementById("tool-tbody");
@@ -675,7 +702,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       const reqTbody = document.getElementById("req-tbody");
       const errTbody = document.getElementById("err-tbody");
 
-      const recentReqs = rows.slice(-currentDepth).reverse();
+      const recentReqs = rows.slice(-depthConfig.req).reverse();
       reqTbody.innerHTML = recentReqs.length ? recentReqs.map(r => `
         <tr>
           <td style="color:var(--text-muted);">${{(r.ts || '').substring(11, 19)}}Z</td>
@@ -689,7 +716,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       `).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No requests recorded</td></tr>';
 
       const errRows = rows.filter(r => r.err || parseInt(r.status || 200) >= 400);
-      const recentErrs = errRows.slice(-currentDepth).reverse();
+      const recentErrs = errRows.slice(-depthConfig.err).reverse();
       errTbody.innerHTML = recentErrs.length ? recentErrs.map(r => `
         <tr>
           <td style="color:var(--text-muted);">${{(r.ts || '').substring(11, 19)}}Z</td>
@@ -697,7 +724,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
           <td>${{(r.m || '').split('/').pop()}}</td>
           <td><span class="os-badge">${{r.os || '?'}}</span> ${{r.caller || 'agent'}}</td>
           <td><strong style="color:var(--red);">${{r.key || '-'}}</strong></td>
-          <td style="color:var(--red); max-width:200px; overflow:hidden; text-overflow:ellipsis;">${{r.err || 'Error'}}</td>
+          <td style="color:var(--red); max-width:260px; overflow:hidden; text-overflow:ellipsis;">${{r.err || 'Error'}}</td>
           <td class="mono-num">${{r.dur || 0}}s</td>
         </tr>
       `).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No errors recorded</td></tr>';
