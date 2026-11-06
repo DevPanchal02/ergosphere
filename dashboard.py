@@ -10,6 +10,7 @@ import analytics
 from controller import controller
 from key_manager import key_manager
 
+
 def get_available_log_days() -> List[Dict[str, Any]]:
     days = set()
     current_day = controller.get_today_str(time.time())
@@ -17,13 +18,11 @@ def get_available_log_days() -> List[Dict[str, Any]]:
 
     all_files = analytics.get_all_log_files()
 
-    # 1. Filename discovery (ensures diagnostics_2026-10-17 is added)
     for path in all_files:
         base = os.path.basename(path)
         if m := re.search(r"\d{4}-\d{2}-\d{2}", base):
             days.add(m.group(0))
 
-    # 2. Row timestamp discovery (ensures midnight rollover dates like 2026-10-21 are added)
     for r in analytics.get_all_rows_cached():
         if d := analytics.row_day(r):
             days.add(d)
@@ -37,6 +36,7 @@ def get_available_log_days() -> List[Dict[str, Any]]:
         results.append({"day": d, "cost": cost, "count": len(day_rows)})
     return results
 
+
 def format_tokens(n: float) -> str:
     try:
         val = float(n or 0)
@@ -47,6 +47,7 @@ def format_tokens(n: float) -> str:
     if abs(val) >= 1_000:
         return f"{val / 1_000:.1f}k"
     return f"{int(val):,}" if val.is_integer() else f"{val:.1f}"
+
 
 def render_cli_text(day_str: str) -> str:
     rows = analytics.read_day_rows(day_str)
@@ -77,9 +78,9 @@ def render_cli_text(day_str: str) -> str:
         out.append(f"  {k['label']:<4} {fb_str} [{k['status_text']:<8}] RPM={k['rpm_used']}/15 TPM={format_tokens(k['tpm_used'])}/{format_tokens(k['tpm_limit'])} RPD={k['rpd_used']}/500 Errs={k['errs']}")
 
     out.append("\n--- CALLERS & AGENTS ---")
-    for c, b in sorted(by_caller.items(), key=lambda x: x[1]["usd"], reverse=True):
+    for _, b in sorted(by_caller.items(), key=lambda x: x[1]["usd"], reverse=True):
         fail_pct = (b['errors'] / b['reqs'] * 100) if b['reqs'] else 0.0
-        out.append(f"  {c:<30} [{b.get('os','?')}] reqs={b['reqs']:<5} fail={fail_pct:4.1f}% ${b['usd']:<7.4f} in={format_tokens(b['in'])}")
+        out.append(f"  {b['caller']:<16} {b['dir']:<30} [{b['os']:<7}] reqs={b['reqs']:<4} fail={fail_pct:4.1f}% ${b['usd']:<6.4f} in={format_tokens(b['in'])}")
 
     out.append("\n--- MODELS BREAKDOWN ---")
     for m, b in sorted(by_model.items(), key=lambda x: x[1]["reqs"], reverse=True):
@@ -95,7 +96,8 @@ def render_cli_text(day_str: str) -> str:
     out.append(f"\n--- RECENT REQUESTS ({min(8, total_reqs)} of {total_reqs}) ---")
     for r in reversed(rows[-8:]):
         c_in_str = f"({format_tokens(r.get('c_in', 0))})" if r.get('c_in') else ""
-        out.append(f"  {r.get('ts','?')[11:19]}Z status={r.get('status',200)} {r.get('m','?'):<18} in={format_tokens(r.get('in',0))}{c_in_str} out={format_tokens(r.get('out',0))} ${float(r.get('cost') or 0):.4f} dur={r.get('dur',0)}s")
+        c_str = f"{r.get('caller','User')}:{r.get('dir','adhoc')}"
+        out.append(f"  {r.get('ts','?')[11:19]}Z status={r.get('status',200)} {r.get('m','?'):<18} caller={c_str:<24} in={format_tokens(r.get('in',0))}{c_in_str} out={format_tokens(r.get('out',0))} ${float(r.get('cost') or 0):.4f} dur={r.get('dur',0)}s")
 
     err_rows = [r for r in rows if r.get("err") or int(r.get("status") or 200) >= 400]
     out.append(f"\n--- RECENT ERRORS ({min(8, len(err_rows))} of {len(err_rows)}) ---")
@@ -107,6 +109,7 @@ def render_cli_text(day_str: str) -> str:
         out.append("  (no errors recorded for this day)")
 
     return "\n".join(out) + "\n"
+
 
 def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     now = time.time()
@@ -177,12 +180,11 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       --red: #ef4444;
       --amber: #f59e0b;
       --cyan: #38bdf8;
-      --accent: #2563eb;
+      --purple: #c084fc;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     body {{ background: var(--bg); color: var(--text); padding: 6px 8px; font-size: 13px; line-height: 1.35; height: 100vh; max-height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
 
-    /* Exact Original Top Bar */
     .top-bar {{ display: flex; align-items: center; justify-content: space-between; background: var(--card); border: 1px solid var(--card-border); padding: 5px 10px; margin-bottom: 6px; border-radius: 4px; flex-shrink: 0; }}
     .brand {{ display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--cyan); font-size: 14px; letter-spacing: 0.5px; }}
     .pill {{ padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
@@ -236,7 +238,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .d-date {{ color: var(--text); }}
     .d-cost {{ color: var(--cyan); font-variant-numeric: tabular-nums; }}
 
-    /* Layout: Left Sidebar + Right Main Workspace */
     .cockpit-layout {{
       display: grid;
       grid-template-columns: 340px minmax(0, 1fr);
@@ -255,7 +256,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .btn-action {{ background: #1e293b; border: 1px solid #334155; color: var(--text); padding: 2px 6px; font-size: 10px; border-radius: 3px; cursor: pointer; }}
     .btn-action:hover {{ background: #334155; }}
 
-    /* Scheduler Logic Box */
     .balancer-card {{
       background: rgba(0, 0, 0, 0.4);
       border: 1px solid #1e293b;
@@ -269,7 +269,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .bal-title {{ color: var(--text-muted); font-size: 9.5px; font-weight: 700; text-transform: uppercase; }}
     .bal-val {{ font-weight: 700; color: #fff; font-size: 11px; }}
 
-    /* Left Fleet Column */
     .fleet-grid {{
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -310,7 +309,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .tpm-track {{ background: #162035; height: 3px; border-radius: 2px; overflow: hidden; margin-top: 3px; }}
     .tpm-bar {{ height: 100%; }}
 
-    /* Main Right Workspace */
     .main-workspace {{
       display: flex;
       flex-direction: column;
@@ -341,7 +339,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     .status-ok {{ color: var(--green); font-weight: 700; }}
     .status-err {{ color: var(--red); font-weight: 700; }}
 
-    /* Depth Input */
     .depth-sync-input {{
       width: 44px;
       background: #141d2f;
@@ -354,9 +351,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       text-align: center;
       outline: none;
     }}
-    .depth-sync-input:focus {{ border-color: var(--cyan); }}
 
-    /* Zero-Scroll Auto-Fit Containers */
     .table-fill {{
       flex: 1;
       overflow-y: auto;
@@ -366,7 +361,12 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     }}
     .table-fill::-webkit-scrollbar {{ width: 4px; height: 4px; }}
     .table-fill::-webkit-scrollbar-thumb {{ background: #1e293b; border-radius: 2px; }}
-    .os-badge {{ font-size: 9px; padding: 0 4px; border-radius: 2px; background: #1e293b; color: var(--cyan); text-transform: uppercase; font-weight: 700; }}
+    
+    .os-badge {{ font-size: 9px; padding: 1px 4px; border-radius: 2px; background: #1e293b; color: var(--cyan); text-transform: uppercase; font-weight: 700; }}
+    .caller-badge {{ font-size: 9.5px; padding: 1px 5px; border-radius: 2px; font-weight: 700; text-transform: uppercase; }}
+    .caller-agent {{ background: rgba(192, 132, 252, 0.15); color: var(--purple); border: 1px solid rgba(192, 132, 252, 0.4); }}
+    .caller-tool {{ background: rgba(56, 189, 248, 0.15); color: var(--cyan); border: 1px solid rgba(56, 189, 248, 0.4); }}
+    .caller-user {{ background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.4); }}
   </style>
 </head>
 <body>
@@ -409,7 +409,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         <button class="btn-action" onclick="copyCardData('fleet-box', this)">Copy</button>
       </div>
 
-      <!-- Scheduler Telemetry Box -->
       <div class="balancer-card">
         <div class="bal-row">
           <span class="bal-title">EQUATION</span>
@@ -473,18 +472,19 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <!-- Row 2: Callers & Agents (Max 115px) -->
-      <div class="bento-card" style="flex-shrink: 0; max-height: 115px;">
+      <!-- Row 2: Callers & Agents (Separate Type, Directory, OS columns) -->
+      <div class="bento-card" style="flex-shrink: 0; max-height: 125px;">
         <div class="card-head">
-          <span>Callers & Agents</span>
+          <span>Callers, Projects & Execution Scope</span>
           <button class="btn-action" onclick="copyCardData('caller-table', this)">Copy</button>
         </div>
         <div class="table-fill">
           <table id="caller-table">
             <thead>
               <tr>
-                <th>Caller / Agent ID</th>
-                <th>Platform</th>
+                <th>Caller</th>
+                <th>Call Path</th>
+                <th>OS</th>
                 <th class="mono-num">Requests</th>
                 <th class="mono-num">Fail Rate</th>
                 <th class="mono-num">Spend</th>
@@ -498,7 +498,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <!-- Row 3: Requests & Errors Side-by-Side (Equal Width 1:1, Depth Filter on Right with Copy) -->
+      <!-- Row 3: Requests & Errors Side-by-Side (1:1 Equal Width) -->
       <div class="grid-2col-equal" style="flex: 1; min-height: 0;">
         
         <!-- Recent Requests -->
@@ -518,12 +518,13 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
                   <th>Time</th>
                   <th>Status</th>
                   <th>Model</th>
-                  <th>Caller / Agent</th>
+                  <th>Caller</th>
+                  <th>Directory</th>
                   <th>Key</th>
                   <th class="mono-num">In (Cached)</th>
                   <th class="mono-num">Out</th>
                   <th class="mono-num">Cost</th>
-                  <th class="mono-num">Duration</th>
+                  <th class="mono-num">Dur</th>
                 </tr>
               </thead>
               <tbody id="req-tbody"></tbody>
@@ -548,10 +549,11 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
                   <th>Time</th>
                   <th>Status</th>
                   <th>Model</th>
-                  <th>Caller / Agent</th>
+                  <th>Caller</th>
+                  <th>Directory</th>
                   <th>Key</th>
                   <th>Failure Cause</th>
-                  <th class="mono-num">Duration</th>
+                  <th class="mono-num">Dur</th>
                 </tr>
               </thead>
               <tbody id="err-tbody"></tbody>
@@ -602,7 +604,13 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       }}
     }}
 
-    // Accurately calculates the exact number of rows that fit without vertical scrollbars
+    function getCallerBadge(c) {{
+      const low = (c || '').toLowerCase();
+      if (low.startsWith('agent-tool') || low.startsWith('tool')) return `<span class="caller-badge caller-tool">${{c}}</span>`;
+      if (low.startsWith('agent')) return `<span class="caller-badge caller-agent">${{c}}</span>`;
+      return `<span class="caller-badge caller-user">${{c}}</span>`;
+    }}
+
     function computeDynamicDepth() {{
       const reqContainer = document.getElementById("req-scroll-container");
       const reqTable = document.getElementById("req-table");
@@ -708,8 +716,11 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
       rows.forEach(r => {{
         const m = r.m || 'unknown';
-        const c = r.caller || 'agent';
+        const c_type = r.caller || 'User';
+        const c_dir = r.dir || 'adhoc';
         const c_os = r.os || 'unknown';
+        const callerKey = `${{c_type}}::${{c_dir}}`;
+
         const cost = parseFloat(r.cost || 0);
         const p_in = parseInt(r.in || 0);
         const p_cin = parseInt(r.c_in || 0);
@@ -726,12 +737,12 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         byModel[m].rout += p_rout;
         if (isErr) byModel[m].errs++;
 
-        if (!byCaller[c]) byCaller[c] = {{ reqs: 0, usd: 0, in: 0, out: 0, errs: 0, os: c_os }};
-        byCaller[c].reqs++;
-        byCaller[c].usd += cost;
-        byCaller[c].in += p_in;
-        byCaller[c].out += p_out;
-        if (isErr) byCaller[c].errs++;
+        if (!byCaller[callerKey]) byCaller[callerKey] = {{ reqs: 0, usd: 0, in: 0, out: 0, errs: 0, caller: c_type, dir: c_dir, os: c_os }};
+        byCaller[callerKey].reqs++;
+        byCaller[callerKey].usd += cost;
+        byCaller[callerKey].in += p_in;
+        byCaller[callerKey].out += p_out;
+        if (isErr) byCaller[callerKey].errs++;
 
         (r.tools_called || []).forEach(t => {{
           if (t && t !== '?') toolCounts[t] = (toolCounts[t] || 0) + 1;
@@ -753,15 +764,16 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </tr>
       `).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No activity</td></tr>';
 
-      // Callers & Agents Table (With bounded text width to prevent horizontal blowout)
+      // Callers & Agents Table
       const callerTbody = document.getElementById("caller-tbody");
       const callerKeys = Object.keys(byCaller).sort((a,b) => byCaller[b].reqs - byCaller[a].reqs);
-      callerTbody.innerHTML = callerKeys.length ? callerKeys.map(c => {{
-        const b = byCaller[c];
+      callerTbody.innerHTML = callerKeys.length ? callerKeys.map(k => {{
+        const b = byCaller[k];
         const failRate = b.reqs ? ((b.errs / b.reqs) * 100).toFixed(1) : '0.0';
         return `
           <tr>
-            <td style="font-weight:700; color:var(--text); max-width:180px; overflow:hidden; text-overflow:ellipsis;" title="${{c}}">${{c}}</td>
+            <td>${{getCallerBadge(b.caller)}}</td>
+            <td style="font-weight:700; color:var(--text); max-width:210px; overflow:hidden; text-overflow:ellipsis;" title="${{b.dir}}">${{b.dir}}</td>
             <td><span class="os-badge">${{b.os}}</span></td>
             <td class="mono-num">${{b.reqs.toLocaleString()}}</td>
             <td class="mono-num" style="color:${{parseFloat(failRate) > 0 ? 'var(--red)' : 'var(--text-muted)'}}; font-weight:${{parseFloat(failRate) > 0 ? '700' : 'normal'}};">${{failRate}}%</td>
@@ -771,7 +783,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
             <td class="mono-num" style="color:${{b.errs ? 'var(--red)' : 'inherit'}};">${{b.errs}}</td>
           </tr>
         `;
-      }}).join('') : '<tr><td colspan="8" style="text-align:center; color:var(--text-muted);">No active callers</td></tr>';
+      }}).join('') : '<tr><td colspan="9" style="text-align:center; color:var(--text-muted);">No active callers</td></tr>';
 
       // Tools Table
       const toolTbody = document.getElementById("tool-tbody");
@@ -796,13 +808,15 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       reqTbody.innerHTML = recentReqs.length ? recentReqs.map(r => {{
         const ht = formatHumanTime(r.ts);
         const inStr = `${{formatTok(r.in || 0)}} <small style="color:var(--text-muted);">(${{formatTok(r.c_in || 0)}})</small>`;
-        const callerName = r.caller || 'agent';
+        const c_type = r.caller || 'User';
+        const c_dir = r.dir || 'adhoc';
         return `
           <tr>
             <td style="color:var(--text-muted);"><b>${{ht.time}}</b> <small>(${{ht.rel}})</small></td>
             <td class="${{r.status < 400 ? 'status-ok' : 'status-err'}}">${{r.status || 200}}</td>
-            <td style="max-width:110px; overflow:hidden; text-overflow:ellipsis;" title="${{r.m || ''}}">${{(r.m || '').split('/').pop()}}</td>
-            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span class="os-badge">${{r.os || '?'}}</span> <span title="${{callerName}}">${{callerName}}</span></td>
+            <td style="max-width:105px; overflow:hidden; text-overflow:ellipsis;" title="${{r.m || ''}}">${{(r.m || '').split('/').pop()}}</td>
+            <td>${{getCallerBadge(c_type)}}</td>
+            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;" title="${{c_dir}}"><span class="os-badge">${{r.os || '?'}}</span> ${{c_dir}}</td>
             <td><strong style="color:var(--green);">${{r.key || '-'}}</strong></td>
             <td class="mono-num">${{inStr}}</td>
             <td class="mono-num">${{formatTok(r.out || 0)}}</td>
@@ -810,25 +824,27 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
             <td class="mono-num">${{r.dur || 0}}s</td>
           </tr>
         `;
-      }}).join('') : '<tr><td colspan="9" style="text-align:center; color:var(--text-muted);">No requests recorded</td></tr>';
+      }}).join('') : '<tr><td colspan="10" style="text-align:center; color:var(--text-muted);">No requests recorded</td></tr>';
 
       const errRows = rows.filter(r => r.err || parseInt(r.status || 200) >= 400);
       const recentErrs = errRows.slice(-depthConfig.err).reverse();
       errTbody.innerHTML = recentErrs.length ? recentErrs.map(r => {{
         const ht = formatHumanTime(r.ts);
-        const callerName = r.caller || 'agent';
+        const c_type = r.caller || 'User';
+        const c_dir = r.dir || 'adhoc';
         return `
           <tr>
             <td style="color:var(--text-muted);"><b>${{ht.time}}</b> <small>(${{ht.rel}})</small></td>
             <td class="status-err">${{r.status || 500}}</td>
-            <td style="max-width:110px; overflow:hidden; text-overflow:ellipsis;" title="${{r.m || ''}}">${{(r.m || '').split('/').pop()}}</td>
-            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;"><span class="os-badge">${{r.os || '?'}}</span> <span title="${{callerName}}">${{callerName}}</span></td>
+            <td style="max-width:105px; overflow:hidden; text-overflow:ellipsis;" title="${{r.m || ''}}">${{(r.m || '').split('/').pop()}}</td>
+            <td>${{getCallerBadge(c_type)}}</td>
+            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;" title="${{c_dir}}"><span class="os-badge">${{r.os || '?'}}</span> ${{c_dir}}</td>
             <td><strong style="color:var(--red);">${{r.key || '-'}}</strong></td>
-            <td style="color:var(--red); max-width:180px; overflow:hidden; text-overflow:ellipsis;" title="${{r.err || 'Error'}}">${{r.err || 'Error'}}</td>
+            <td style="color:var(--red); max-width:170px; overflow:hidden; text-overflow:ellipsis;" title="${{r.err || 'Error'}}">${{r.err || 'Error'}}</td>
             <td class="mono-num">${{r.dur || 0}}s</td>
           </tr>
         `;
-      }}).join('') : '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">No errors recorded</td></tr>';
+      }}).join('') : '<tr><td colspan="8" style="text-align:center; color:var(--text-muted);">No errors recorded</td></tr>';
     }}
 
     function copyCardData(elementId, btn) {{
@@ -907,7 +923,6 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     renderSummaryTables();
     renderRequestsAndErrors();
 
-    // Auto-scale on load so table height perfectly matches container without scrollbar
     computeDynamicDepth();
     renderRequestsAndErrors();
 

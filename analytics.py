@@ -11,80 +11,168 @@ import config
 # In-memory cache for parsed log rows: path -> {"mtime": mtime, "size": size, "rows": [...]}
 _FILE_CACHE: Dict[str, Dict[str, Any]] = {}
 
-def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[str, str]:
-    h = {k.lower(): v for k, v in headers.items()}
-    raw_caller = (
-        h.get("x-agent-id") or
-        h.get("x-caller-id") or
-        h.get("x-agent-role") or
-        h.get("x-role") or
-        h.get("x-opencode-agent") or
-        h.get("x-project-path") or
-        h.get("x-workspace-path") or
-        body.get("agent_id") or
-        body.get("agent") or
-        body.get("role") or
-        body.get("user") or
-        ""
-    ).strip()
 
-    user_agent = h.get("user-agent", "")
-    client_os = h.get("x-client-os") or h.get("x-host-os") or ""
+def sanitize_path(raw_path: str) -> Tuple[str, str]:
+    """
+    Dynamically strips OS drive prefixes and user home directories WITHOUT any hardcoded folder names.
+    Applies a 2-3 segment sliding window so parent directory hierarchies are never doxxed.
+    Returns: (rough_directory, detected_os)
+    """
+    if not raw_path or raw_path.strip() in ("", "-", "unknown", "none"):
+        return "terminal/adhoc", "unknown"
+
+    raw = raw_path.strip().replace("\\", "/")
+
+    # 1. OS Detection from path syntax
     detected_os = "unknown"
-
-    if client_os:
-        detected_os = client_os.lower()
-    elif re.match(r"^[A-Za-z]:[\\/]", raw_caller) or "\\" in raw_caller or "windows" in user_agent.lower():
+    if re.match(r"^[A-Za-z]:", raw_path) or "\\" in raw_path:
         detected_os = "windows"
-    elif raw_caller.startswith("/Users/") or "macintosh" in user_agent.lower() or "darwin" in user_agent.lower():
+    elif raw.startswith("/Users/"):
         detected_os = "macos"
-    elif raw_caller.startswith(("/home/", "/root/")) or "linux" in user_agent.lower():
+    elif raw.startswith(("/home/", "/root/")):
         detected_os = "linux"
 
-    lower_caller = raw_caller.lower()
-    for role in ("builder", "planner", "scout", "explorer", "architect", "coder", "reviewer"):
-        if role in lower_caller:
-            return role, detected_os
+    # 2. Dynamic Home/User Directory Stripping (Works on any username/drive)
+    # Strips 'C:/Users/<username>/', '/Users/<username>/', '/home/<username>/', '/root/'
+    cleaned = re.sub(r"^[A-Za-z]:/(?:Users|home)/[^/]+/", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^/(?:Users|home)/[^/]+/", "", cleaned)
+    cleaned = re.sub(r"^/root/", "", cleaned)
+    cleaned = cleaned.lstrip("/")
 
+    # 3. Dynamic Sliding Window: Keep the last 2 to 3 meaningful directory segments
+    parts = [p for p in cleaned.split("/") if p and p not in (".", "..")]
+    if len(parts) >= 3:
+        rough_dir = "/".join(parts[-3:])
+    elif len(parts) > 0:
+        rough_dir = "/".join(parts)
+    else:
+        rough_dir = "root"
+
+    return rough_dir, detected_os
+
+
+def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[str, str, str]:
+    """
+    Extracts (caller_type, rough_directory, detected_os) across all scenarios:
+      - OpenCode Agents (builder, planner, scout, reviewer)
+      - Agent-made tools running in test loops or standalone
+      - Manual user projects outside OpenCode
+      - Ad-hoc curl / terminal calls
+    """
+    h = {k.lower(): v for k, v in headers.items()}
+    auth = h.get("authorization", "")
+    user_param = str(body.get("user") or "").strip()
+    user_agent = h.get("user-agent", "").lower()
+
+    caller_type = "User"
+    raw_path = ""
+    os_hint = "unknown"
+
+    # 1. Check Bearer Token (sk-<type>-<path> or sk-<os>-<project>)
+    if "bearer " in auth.lower():
+        raw_token = auth[auth.lower().index("bearer ") + 7:].strip()
+        if raw_token.lower().startswith("sk-"):
+            raw_token = raw_token[3:]
+
+        parts = raw_token.split("-")
+        first = parts[0].lower() if parts else ""
+
+        if first in ("agent_tool", "tool"):
+            caller_type = "Agent-Tool"
+            raw_path = "-".join(parts[1:])
+        elif first == "agent":
+            if len(parts) > 2 and parts[1].lower() in ("builder", "planner", "scout", "explorer", "reviewer", "coder"):
+                caller_type = f"Agent:{parts[1].lower()}"
+                raw_path = "-".join(parts[2:])
+            else:
+                caller_type = "Agent"
+                raw_path = "-".join(parts[1:])
+        elif first == "user":
+            caller_type = "User"
+            raw_path = "-".join(parts[1:])
+        elif first in ("mac", "darwin"):
+            os_hint = "macos"
+            raw_path = "-".join(parts[1:])
+        elif first in ("pc", "win", "windows"):
+            os_hint = "windows"
+            raw_path = "-".join(parts[1:])
+        elif first in ("linux", "wsl"):
+            os_hint = "linux"
+            raw_path = "-".join(parts[1:])
+        else:
+            raw_path = raw_token
+
+    # 2. Check Standard OpenAI "user" field
+    if user_param:
+        if ":" in user_param:
+            prefix, path_val = user_param.split(":", 1)
+            p_low = prefix.lower()
+            if "tool" in p_low:
+                caller_type = "Agent-Tool"
+            elif "agent" in p_low:
+                caller_type = "Agent"
+            else:
+                caller_type = "User"
+            raw_path = path_val
+        else:
+            if caller_type == "User":
+                raw_path = user_param
+            else:
+                raw_path = f"{raw_path}/{user_param}" if raw_path else user_param
+
+    # 3. Explicit Headers (if present)
+    explicit_path = (
+        h.get("x-caller-path") or
+        h.get("x-project-dir") or
+        h.get("x-file-path") or
+        h.get("x-workspace-path") or
+        h.get("x-project-path") or
+        ""
+    ).strip()
+    if explicit_path:
+        raw_path = explicit_path
+
+    if h.get("x-caller-type"):
+        caller_type = h["x-caller-type"]
+    elif h.get("x-agent-role") or h.get("x-opencode-agent"):
+        caller_type = f"Agent:{h.get('x-agent-role') or h.get('x-opencode-agent')}"
+
+    # 4. OpenCode System Prompt Sniffing (For meta-agent loops)
     for msg in (body.get("messages") or []):
         if isinstance(msg, dict) and msg.get("role") in ("system", "user"):
             content = str(msg.get("content") or "").lower()
-            for role in ("builder", "planner", "scout", "explorer"):
-                if f"you are the {role}" in content or f"role: {role}" in content:
-                    return role, detected_os
+            for role in ("builder", "planner", "scout", "explorer", "reviewer", "coder"):
+                if f"you are the {role}" in content or f"you are a {role}" in content:
+                    caller_type = f"Agent:{role}"
+                    break
 
-    if raw_caller and raw_caller != client_host:
-        sanitized_path, path_os = sanitize_caller(raw_caller)
-        if detected_os == "unknown" and path_os != "unknown":
-            detected_os = path_os
-        return sanitized_path, detected_os
+            # Extract relative project directory mentioned in prompt if raw_path is still empty
+            if not raw_path:
+                m = re.search(r"(?:projects|workspace|repos)/([a-zA-Z0-9_\-\./]+)", content)
+                if m:
+                    raw_path = m.group(0).rstrip("/.")
 
-    return "agent", detected_os
+    # 5. OS Detection from Client Environment / Network
+    if h.get("x-client-os") or h.get("x-host-os"):
+        os_hint = (h.get("x-client-os") or h.get("x-host-os")).lower()
+    elif "darwin" in user_agent or "macintosh" in user_agent or "mac os" in user_agent:
+        os_hint = "macos"
+    elif "windows" in user_agent:
+        os_hint = "windows"
+    elif "linux" in user_agent:
+        os_hint = "linux"
 
-def sanitize_caller(raw_caller: str) -> Tuple[str, str]:
-    detected_os = "unknown"
-    if re.match(r"^[A-Za-z]:[\\/]", raw_caller) or "\\" in raw_caller:
-        detected_os = "windows"
-    elif raw_caller.startswith("/Users/"):
-        detected_os = "macos"
-    elif raw_caller.startswith(("/home/", "/root/")):
-        detected_os = "linux"
+    # Sanitize directory path without hardcoded safe-folders
+    rough_dir, path_os = sanitize_path(raw_path)
 
-    cleaned = raw_caller.replace("\\", "/")
-    cleaned = re.sub(r"^[A-Za-z]:/(?:Users|home)/[^/]+/", "", cleaned)
-    cleaned = re.sub(r"^/(?:Users|home)/[^/]+/", "", cleaned)
+    final_os = path_os if path_os != "unknown" else os_hint
+    if final_os == "unknown":
+        if client_host in ("127.0.0.1", "localhost", "host.docker.internal"):
+            final_os = "windows"
+        else:
+            final_os = "macos"
 
-    for anchor in ("event-horizon/", "projects/", ".opencode/", "workspace/", "repos/"):
-        if anchor in cleaned:
-            return cleaned[cleaned.index(anchor):], detected_os
-
-    parts = [p for p in cleaned.split("/") if p]
-    if len(parts) > 2:
-        return "/".join(parts[-3:]), detected_os
-    if cleaned:
-        return cleaned, detected_os
-
-    return "agent", detected_os
+    return caller_type, rough_dir, final_os
 
 def clean_error_message(msg: str) -> str:
     clean = config.scrub(str(msg))
@@ -106,6 +194,7 @@ def clean_error_message(msg: str) -> str:
         return m.group(1)[:120]
     return clean.split("\n")[0][:120]
 
+
 def row_day(entry: dict) -> Optional[str]:
     ts_str = entry.get("ts")
     if not ts_str:
@@ -119,6 +208,7 @@ def row_day(entry: dict) -> Optional[str]:
     except Exception:
         return ts_str[:10]
 
+
 def row_timestamp(entry: dict) -> float:
     ts_str = entry.get("ts")
     if not ts_str:
@@ -128,6 +218,7 @@ def row_timestamp(entry: dict) -> float:
         return dt.timestamp()
     except Exception:
         return 0.0
+
 
 def get_all_log_files() -> List[str]:
     found = []
@@ -139,8 +230,10 @@ def get_all_log_files() -> List[str]:
                 found.append(os.path.join(root, f))
     return sorted(found)
 
+
 def get_today_log_path(day_str: str) -> str:
     return os.path.join(config.LOGS_DIR, f"diagnostics_{day_str}.jsonl")
+
 
 def log_diagnostic(entry: dict):
     local_day = row_day(entry) or datetime.now(config.TZ).strftime("%Y-%m-%d")
@@ -151,6 +244,7 @@ def log_diagnostic(entry: dict):
             f.write(line + "\n")
     except OSError as e:
         config.log.warning("Could not write diagnostic row: %s", e)
+
 
 def capture_incident_payload(rid: str, cost: float, prompt_tokens: int, payload: dict):
     if cost < config.HIGH_COST_THRESHOLD_USD and prompt_tokens < config.HIGH_TOKEN_THRESHOLD:
@@ -168,6 +262,7 @@ def capture_incident_payload(rid: str, cost: float, prompt_tokens: int, payload:
         config.log.info("Incident blackbox saved: %s (cost=$%.4f, tokens=%d)", file_name, cost, prompt_tokens)
     except OSError as e:
         config.log.warning("Could not save incident payload: %s", e)
+
 
 def get_all_rows_cached() -> List[dict]:
     all_files = get_all_log_files()
@@ -204,12 +299,8 @@ def get_all_rows_cached() -> List[dict]:
     combined_rows.sort(key=lambda r: r.get("ts", ""))
     return combined_rows
 
+
 def read_day_rows(day_str: str) -> list[dict]:
-    """
-    Two-pass loader:
-    Pass 1 matches rows strictly by local date.
-    Pass 2 fallback loads files named after the date (e.g. diagnostics_2026-10-17...) if 0 rows matched by timestamp.
-    """
     all_rows = get_all_rows_cached()
     matched = [r for r in all_rows if row_day(r) == day_str]
 
@@ -240,9 +331,11 @@ def read_day_rows(day_str: str) -> list[dict]:
     matched.sort(key=lambda r: r.get("ts", ""))
     return matched
 
+
 def get_rolling_rpm(rows: list[dict], now: float) -> int:
     cutoff = now - 60.0
     return sum(1 for r in rows if row_timestamp(r) >= cutoff)
+
 
 def parse_usage_and_cost(usage_obj: Any, target_model: str) -> dict:
     if not usage_obj:
@@ -275,16 +368,32 @@ def parse_usage_and_cost(usage_obj: Any, target_model: str) -> dict:
         "cost": round(cost, 5),
     }
 
+
 def summarize_rows(rows: list[dict]):
     by_model = defaultdict(lambda: {"reqs": 0, "usd": 0.0, "in": 0, "cached": 0, "out": 0, "reasoning": 0, "errors": 0})
-    by_caller = defaultdict(lambda: {"reqs": 0, "usd": 0.0, "in": 0, "out": 0, "errors": 0, "os": "unknown"})
+    by_caller = defaultdict(lambda: {
+        "reqs": 0, "usd": 0.0, "in": 0, "out": 0, "errors": 0,
+        "caller": "User", "dir": "adhoc", "os": "unknown"
+    })
     by_agent = defaultdict(lambda: {"reqs": 0, "usd": 0.0, "in": 0, "cached": 0, "out": 0, "reasoning": 0, "errors": 0})
     tool_counts = defaultdict(int)
 
     for r in rows:
         m = r.get("m", "unknown")
-        caller = r.get("caller") or "agent"
-        caller_os = r.get("os", "unknown")
+        
+        # Backwards-compatible extraction
+        caller_type = r.get("caller") or "User"
+        caller_dir = r.get("dir")
+        caller_os = r.get("os") or "unknown"
+        if not caller_dir:
+            # If an old log format exists without 'dir', sanitize it now
+            s_dir, s_os = sanitize_path(caller_type)
+            caller_dir = s_dir
+            if caller_os == "unknown":
+                caller_os = s_os
+            caller_type = "Agent" if "agent" in str(r.get("caller")).lower() else "User"
+
+        caller_key = f"{caller_type}::{caller_dir}"
 
         names = r.get("tool_names") or []
         sig = ",".join(names[:3]) + ("..." if len(names) > 3 else "") if names else f"{r.get('tools_in', 0)} tools"
@@ -307,12 +416,14 @@ def summarize_rows(rows: list[dict]):
             if is_err:
                 b["errors"] += 1
 
-        bc = by_caller[caller]
+        bc = by_caller[caller_key]
+        bc["caller"] = caller_type
+        bc["dir"] = caller_dir
+        bc["os"] = caller_os
         bc["reqs"] += 1
         bc["usd"] += cost
         bc["in"] += p_in
         bc["out"] += p_out
-        bc["os"] = caller_os
         if is_err:
             bc["errors"] += 1
 

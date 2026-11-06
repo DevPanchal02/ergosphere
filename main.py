@@ -22,6 +22,7 @@ app = FastAPI(title="Horizon Proxy")
 
 _sse_subscribers: Set[asyncio.Queue] = set()
 
+
 async def broadcast_live_event(event_type: str, row: Optional[dict] = None):
     if not _sse_subscribers:
         return
@@ -47,6 +48,7 @@ async def broadcast_live_event(event_type: str, row: Optional[dict] = None):
             dead.add(q)
     _sse_subscribers.difference_update(dead)
 
+
 def estimate_tokens(body: dict) -> int:
     msgs = body.get("messages") or []
     try:
@@ -58,8 +60,10 @@ def estimate_tokens(body: dict) -> int:
             chars += len(str(tools))
         return max(1, chars // 4)
 
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 @app.get("/health")
 async def health():
@@ -82,6 +86,7 @@ async def health():
         "spend_today_usd": round(controller.ledger["day_usd"], 4)
     })
 
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
@@ -91,7 +96,7 @@ async def list_models():
         "data": [{"id": m, "object": "model", "created": int(time.time()), "owned_by": "horizon-proxy"} for m in model_ids],
     }
 
-# -- Fleet and key control API endpoints --
+
 @app.post("/api/key/fallback")
 async def set_key_fallback_route(request: Request):
     body = await request.json()
@@ -101,6 +106,7 @@ async def set_key_fallback_route(request: Request):
     await broadcast_live_event("heartbeat")
     return {"status": "ok", "key": key_label, "fallback": fallback}
 
+
 @app.post("/api/key/unquarantine")
 async def unquarantine_key_route(request: Request):
     body = await request.json()
@@ -109,7 +115,30 @@ async def unquarantine_key_route(request: Request):
     await broadcast_live_event("heartbeat")
     return {"status": "ok", "key": key_label}
 
-# -- Real-time SSE live stream --
+
+@app.post("/api/limits")
+async def update_key_limits_route(request: Request):
+    body = await request.json()
+    key_manager.update_limits(
+        rpm=body.get("rpm"),
+        tpm=body.get("tpm"),
+        rpd=body.get("rpd"),
+        max_parallel=body.get("max_parallel")
+    )
+    await broadcast_live_event("heartbeat")
+    return {"status": "ok", "limits": key_manager.get_pool_status(time.time())["limits"]}
+
+
+@app.post("/api/spend/limits")
+async def update_spend_limits_route(request: Request):
+    body = await request.json()
+    daily_usd = float(body.get("daily_usd", controller.daily_cap))
+    run_usd = float(body.get("run_usd", controller.run_cap))
+    controller.save_limits(daily_usd, run_usd)
+    await broadcast_live_event("heartbeat")
+    return {"status": "ok", "daily_cap": controller.daily_cap, "run_cap": controller.run_cap}
+
+
 @app.get("/api/live")
 async def sse_live_feed(request: Request):
     queue = asyncio.Queue(maxsize=100)
@@ -163,7 +192,7 @@ async def sse_live_feed(request: Request):
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     )
 
-# -- Chat completions proxy --
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
@@ -179,13 +208,18 @@ async def chat_completions(request: Request):
     target_backend_model = model
 
     client_host = request.client.host if request.client else "unknown"
-    caller_path, caller_os = analytics.detect_caller_and_os(dict(request.headers), body, client_host)
+    caller_type, caller_dir, caller_os = analytics.detect_caller_and_os(
+        dict(request.headers), body, client_host
+    )
 
     tool_names = sorted({(t.get("function") or {}).get("name", "?") for t in (body.get("tools") or []) if isinstance(t, dict)})
     tools_in_count = len(body.get("tools") or [])
 
-    config.log.info("[%s] -> %s stream=%s caller=[%s|%s] msgs=%d tools=%d",
-                    rid, model, is_stream, caller_os, caller_path, len(body.get("messages") or []), tools_in_count)
+    config.log.info(
+        "[%s] -> %s stream=%s caller=[%s | %s | %s] msgs=%d tools=%d",
+        rid, model, is_stream, caller_type, caller_os, caller_dir,
+        len(body.get("messages") or []), tools_in_count
+    )
 
     gemini_key_label = None
     gemini_reserved = 0
@@ -263,7 +297,8 @@ async def chat_completions(request: Request):
                 err_msg = str(ex)
                 duration = round(time.time() - t0, 2)
                 diag_row = {
-                    "ts": now_iso(), "rid": rid, "m": model, "caller": caller_path, "os": caller_os,
+                    "ts": now_iso(), "rid": rid, "m": model,
+                    "caller": caller_type, "dir": caller_dir, "os": caller_os,
                     "key": "DEAD", "status": 503, "dur": duration, "in": 0, "c_in": 0,
                     "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
                     "tools_called": [], "err": err_msg
@@ -282,11 +317,34 @@ async def chat_completions(request: Request):
             break
         except Exception as e:
             err_msg = str(e)
-            if ("401" in err_msg or "403" in err_msg) and model.startswith("gemini"):
-                config.log.warning("[%s] Gemini key %s failed (401/403). Quarantining and retrying...", rid, key_label)
-                key_manager.quarantine_key(key_label, err_msg[:120])
+            raw_status = getattr(e, "status_code", None)
+            if raw_status is None and hasattr(e, "response") and hasattr(e.response, "status_code"):
+                raw_status = e.response.status_code
+            try:
+                status_code = int(raw_status)
+            except (ValueError, TypeError):
+                status_code = 500
+
+            clean_err = analytics.clean_error_message(err_msg)
+            is_dead_key = (status_code in (401, 403) or "401" in err_msg or "403" in err_msg or "API_KEY_INVALID" in err_msg)
+
+            if is_dead_key and model.startswith("gemini"):
+                duration = round(time.time() - t0, 2)
+                config.log.warning("[%s] Gemini key %s failed (%s). Quarantining and retrying...", rid, key_label, status_code)
+                key_manager.quarantine_key(key_label, clean_err)
                 key_manager.record_error(key_label)
                 excluded_keys.add(key_label)
+
+                diag_row = {
+                    "ts": now_iso(), "rid": rid, "m": model,
+                    "caller": caller_type, "dir": caller_dir, "os": caller_os,
+                    "key": key_label, "status": status_code, "dur": duration, "in": 0, "c_in": 0,
+                    "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
+                    "tools_called": [], "err": f"Key {key_label} quarantined: {clean_err}"
+                }
+                analytics.log_diagnostic(diag_row)
+                asyncio.create_task(broadcast_live_event("telemetry", diag_row))
+
                 if gemini_key_label:
                     key_manager.release_reservation(gemini_key_label, gemini_reserved)
                     gemini_key_label = None
@@ -296,18 +354,13 @@ async def chat_completions(request: Request):
                 key_manager.record_error(gemini_key_label)
             finish_gemini()
             duration = round(time.time() - t0, 2)
-            clean_err = analytics.clean_error_message(err_msg)
-            status_code = getattr(e, "status_code", 500)
-            try:
-                status_code = int(status_code)
-            except (ValueError, TypeError):
-                status_code = 500
 
             config.log.error("[%s] !! %s key=%s status=%s %s | %.1fs | %s",
                              rid, model, key_label, status_code, type(e).__name__, duration, clean_err)
 
             diag_row = {
-                "ts": now_iso(), "rid": rid, "m": model, "caller": caller_path, "os": caller_os,
+                "ts": now_iso(), "rid": rid, "m": model,
+                "caller": caller_type, "dir": caller_dir, "os": caller_os,
                 "key": key_label, "status": status_code, "dur": duration, "in": 0, "c_in": 0,
                 "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
                 "tools_called": [], "err": clean_err
@@ -358,7 +411,8 @@ async def chat_completions(request: Request):
                 )
 
                 diag_row = {
-                    "ts": now_iso(), "rid": rid, "m": model, "caller": caller_path, "os": caller_os,
+                    "ts": now_iso(), "rid": rid, "m": model,
+                    "caller": caller_type, "dir": caller_dir, "os": caller_os,
                     "key": key_label, "status": 200, "dur": total_time, "ttft": round(first_token_time or 0.0, 2),
                     "tools_in": tools_in_count, "tool_names": tool_names, "tools_called": tool_list,
                     **diag, "err": None
@@ -367,6 +421,13 @@ async def chat_completions(request: Request):
                 asyncio.create_task(broadcast_live_event("telemetry", diag_row))
                 analytics.capture_incident_payload(rid, diag["cost"], diag["in"], {"body": body, "usage": diag})
 
+            except (asyncio.CancelledError, GeneratorExit):
+                config.log.warning("[%s] client disconnected mid-stream %s after %.1fs", rid, model, round(time.time() - t0, 2))
+                raise
+            except Exception as e:
+                clean_err = analytics.clean_error_message(str(e))
+                config.log.error("[%s] !! stream error %s %s | %s", rid, model, type(e).__name__, clean_err)
+                raise
             finally:
                 finish_gemini()
 
@@ -395,7 +456,8 @@ async def chat_completions(request: Request):
         )
 
         diag_row = {
-            "ts": now_iso(), "rid": rid, "m": model, "caller": caller_path, "os": caller_os,
+            "ts": now_iso(), "rid": rid, "m": model,
+            "caller": caller_type, "dir": caller_dir, "os": caller_os,
             "key": key_label, "status": 200, "dur": total_time, "ttft": total_time,
             "tools_in": tools_in_count, "tool_names": tool_names, "tools_called": called_tools,
             **diag, "err": None
@@ -408,7 +470,7 @@ async def chat_completions(request: Request):
     finally:
         finish_gemini()
 
-# -- Dashboard endpoints --
+
 @app.get("/")
 @app.get("/usage")
 async def dashboard_view(request: Request, day: Optional[str] = None):
@@ -445,6 +507,7 @@ async def dashboard_view(request: Request, day: Optional[str] = None):
 
     return HTMLResponse(dashboard.render_html_dashboard(target_day))
 
+
 @app.get("/status")
 async def system_status():
     now = time.time()
@@ -458,6 +521,7 @@ async def system_status():
             "run_cap": controller.run_cap
         }
     }
+
 
 if __name__ == "__main__":
     import uvicorn

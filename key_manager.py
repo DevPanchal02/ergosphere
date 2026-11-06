@@ -142,30 +142,28 @@ class GeminiKeyManager:
             ]
 
             if ready_candidates:
-                chosen_pos = min(ready_candidates, key=lambda i: self.rpd_count[i])
+                # Tiebreaker: Lowest daily usage (RPD) -> Least recently used (last_used)
+                chosen_pos = min(ready_candidates, key=lambda i: (self.rpd_count[i], self.last_used[i]))
                 wait_time = 0.0
             else:
                 all_penalties = [
-                    (self.get_key_penalty(i, now, estimated_tokens), self.rpd_count[i], i)
+                    (self.get_key_penalty(i, now, estimated_tokens), self.rpd_count[i], self.last_used[i], i)
                     for i in available_indices
                 ]
                 all_penalties.sort()
-                wait_time, _, chosen_pos = all_penalties[0]
+                wait_time, _, _, chosen_pos = all_penalties[0]
 
-            use_fallback = (
-                self.key_fallback[chosen_pos] or
-                wait_time > 15.0 or
-                (self.rpd_limit > 0 and self.rpd_count[chosen_pos] >= self.rpd_limit)
-            )
+            is_congested = (wait_time > 15.0 or (self.rpd_limit > 0 and self.rpd_count[chosen_pos] >= self.rpd_limit))
+            use_fallback = bool(self.key_fallback[chosen_pos] or is_congested)
 
             start_at = now + wait_time
             self.last_used[chosen_pos] = start_at
             self.rpd_count[chosen_pos] += 1
-            self.key_requests[chosen_pos].append(now)
+            self.key_requests[chosen_pos].append(start_at)
             if estimated_tokens > 0:
                 self.inflight_tokens[chosen_pos] += estimated_tokens
 
-        if wait_time > 0 and not use_fallback:
+        if wait_time > 0 and not is_congested:
             await asyncio.sleep(wait_time)
 
         n, key = self.keys[chosen_pos]
@@ -260,8 +258,24 @@ class GeminiKeyManager:
         healthy_keys = sum(1 for q in self.quarantined if not q)
 
         keys_info = []
-        next_pick = None
-        lowest_penalty = float("inf")
+        available_indices = [i for i in range(self.num_keys) if not self.quarantined[i]]
+        ready_candidates = [i for i in available_indices if self.get_key_penalty(i, now, 0) <= 0.0]
+
+        if ready_candidates:
+            best_idx = min(ready_candidates, key=lambda i: (self.rpd_count[i], self.last_used[i]))
+            next_pick = f"G{self.keys[best_idx][0]}"
+            lowest_penalty = 0.0
+        elif available_indices:
+            all_pens = [
+                (self.get_key_penalty(i, now, 0), self.rpd_count[i], self.last_used[i], i)
+                for i in available_indices
+            ]
+            all_pens.sort()
+            lowest_penalty, _, _, best_idx = all_pens[0]
+            next_pick = f"G{self.keys[best_idx][0]}"
+        else:
+            next_pick = "None"
+            lowest_penalty = 0.0
 
         for i, (n, _) in enumerate(self.keys):
             cd_wait = self.get_rpm_wait(i, now)
@@ -269,10 +283,6 @@ class GeminiKeyManager:
             tpm_used = self.get_tpm_usage(i, now)
             actual_rpm = self.get_key_actual_rpm(i, now)
             penalty = self.get_key_penalty(i, now, 0)
-
-            if not self.quarantined[i] and penalty < lowest_penalty:
-                lowest_penalty = penalty
-                next_pick = f"G{n}"
 
             if self.quarantined[i]:
                 st_text = "DEAD"
