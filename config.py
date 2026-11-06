@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-# -- logging setup --
+# Initialize proxy logger with configurable level and clean console formatting
 log = logging.getLogger("pacer")
 log.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 log.propagate = False
@@ -14,6 +14,7 @@ _sh = logging.StreamHandler()
 _sh.setFormatter(_fmt)
 log.addHandler(_sh)
 
+# Optional rotating file handler if explicit LOG_FILE destination is configured
 if os.getenv("LOG_FILE"):
     try:
         _fh = RotatingFileHandler(os.environ["LOG_FILE"], maxBytes=5_000_000, backupCount=3, encoding="utf-8")
@@ -22,20 +23,25 @@ if os.getenv("LOG_FILE"):
     except OSError as e:
         log.warning("LOG_FILE unusable (%s); logging to stdout only", e)
 
-# -- directories --
+# Filesystem layout: base project path, logs directory, and database location
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 INCIDENTS_DIR = os.path.join(LOGS_DIR, "incidents")
+DB_PATH = os.getenv("DB_PATH", os.path.join(LOGS_DIR, "horizon.db"))
+
+# Legacy JSON fallback paths (retained for backward compatibility during migration)
 SPEND_FILE = os.path.join(LOGS_DIR, "spend_limits.json")
 RUNTIME_SETTINGS_FILE = os.path.join(LOGS_DIR, "runtime_settings.json")
 
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(INCIDENTS_DIR, exist_ok=True)
 
-# -- api keys & secrets --
+# Master key for ingress authentication and external provider keys
+MASTER_KEY = os.getenv("MASTER_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 
 def _discover_gemini_keys():
+    # Discovers GEMINI_KEY_1 through GEMINI_KEY_64 preserving natural numerical ordering
     found = {}
     for k, v in os.environ.items():
         m = re.fullmatch(r"GEMINI_KEY_(\d+)", k)
@@ -49,16 +55,17 @@ def _discover_gemini_keys():
 
 GEMINI_KEYS = _discover_gemini_keys()
 
-_SECRETS = [s for s in [OPENROUTER_KEY, *[k for _, k in GEMINI_KEYS]] if s]
+# Redaction registry: scrub master key, provider secrets, and raw key patterns from logs
+_SECRETS = [s for s in [OPENROUTER_KEY, MASTER_KEY, *[k for _, k in GEMINI_KEYS]] if s]
 _KEY_PATTERNS = re.compile(r"AIza[\w-]{30,}|sk-or-[\w-]+")
 
 def scrub(text: str) -> str:
+    # Replaces sensitive API keys and tokens with asterisks
     for s in _SECRETS:
         text = text.replace(s, "***")
     return _KEY_PATTERNS.sub("***", text)
 
-# -- pricing and routing --
-# (uncached_in, cached_in, out) per 1M tokens
+# Model pricing ledger: (uncached_prompt, cached_prompt, completion) per 1M tokens
 PRICING = {
     "openrouter/xiaomi/mimo-v2.6-pro": (0.435, 0.00435, 0.87),
     "openrouter/openai/gpt-6.1-sol":    (2.00,  0.10,    10.00),
@@ -66,6 +73,7 @@ PRICING = {
     "gemini/gemini-3.1-flash-lite":    (0.00,  0.00,     0.00),
 }
 
+# OpenRouter target routing map with optional reasoning effort parameters
 OPENROUTER_ROUTES = {
     "mimo-v2.6-pro": ("openrouter/xiaomi/mimo-v2.6-pro", None),
     "gpt-6.1-sol-medium": ("openrouter/openai/gpt-6.1-sol", "medium"),
@@ -73,25 +81,29 @@ OPENROUTER_ROUTES = {
     "gpt-6.1-sol-x-high": ("openrouter/openai/gpt-6.1-sol", "xhigh"),
 }
 
+# Gemini execution models
 PRIMARY_GEMINI_MODEL = "gemini/gemini-3.5-flash-lite"
 FALLBACK_GEMINI_MODEL = "gemini/gemini-3.1-flash-lite"
 
+# Spend controller defaults and operational thresholds
 DEFAULT_DAILY_SPEND_LIMIT_USD = float(os.getenv("DAILY_SPEND_LIMIT_USD", os.getenv("DAILY_BUDGET_USD", "3.00")))
 DEFAULT_RUN_SPEND_LIMIT_USD = float(os.getenv("RUN_SPEND_LIMIT_USD", os.getenv("RUN_BUDGET_USD", "1.50")))
 RUN_IDLE_SECONDS = float(os.getenv("RUN_IDLE_SECONDS", "900"))
 LOCAL_TZ = os.getenv("TIMEZONE", os.getenv("BUDGET_TZ", "America/Toronto"))
 MAX_OUT_TOKENS = int(os.getenv("MAX_OUT_TOKENS", "32000"))
 
-# Default Gemini 3.5 / 3.1 Flash-Lite Limits
+# Gemini key limits and pacing parameters
 GEMINI_RPM_LIMIT = int(os.getenv("GEMINI_KEY_RPM", "15"))
 GEMINI_TPM_LIMIT = int(os.getenv("GEMINI_KEY_TPM", "250000"))
 GEMINI_RPD_LIMIT = int(os.getenv("GEMINI_KEY_RPD", "500"))
-GEMINI_PARALLEL = int(os.getenv("GEMINI_PARALLEL", "0"))  # 0 = unthrottled
+GEMINI_PARALLEL = int(os.getenv("GEMINI_PARALLEL", "0"))  # 0 = unthrottled gate
 TPM_WINDOW_SECONDS = 60.0
 
+# Incident blackbox thresholds for deep inspection
 HIGH_COST_THRESHOLD_USD = float(os.getenv("HIGH_COST_THRESHOLD_USD", "0.05"))
 HIGH_TOKEN_THRESHOLD = int(os.getenv("HIGH_TOKEN_THRESHOLD", "150000"))
 
+# Timezone resolution with graceful fallback to system timezone or UTC
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo(LOCAL_TZ)
