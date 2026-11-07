@@ -1,5 +1,6 @@
 import logging
 import unittest
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import analytics
@@ -59,7 +60,7 @@ class TestAPI(unittest.TestCase):
 
         res = self.client.post("/v1/chat/completions", json={
             "model": "mimo-v2.6-pro",
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [{"role": "user", "content": "hi"}],
         })
 
         self.assertEqual(res.status_code, 402)
@@ -70,10 +71,40 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn("HORIZON PROXY", res.text)
 
+    # --- Ingress Master Key Authentication Tests ---
+
+    def test_enforces_master_key_when_configured(self):
+        # When MASTER_KEY is set, unauthorized requests must be rejected with 401
+        with patch.object(config, "MASTER_KEY", "sk_horizon_master_secret"):
+            # 1. Missing Authorization header -> 401
+            res_no_auth = self.client.post("/v1/chat/completions", json={
+                "model": "gemini-3.5-flash-lite",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            self.assertEqual(res_no_auth.status_code, 401)
+            self.assertIn("Invalid or missing Master Key", res_no_auth.json()["detail"])
+
+            # 2. Invalid Master Key -> 401
+            res_bad_auth = self.client.post("/v1/chat/completions", headers={
+                "Authorization": "Bearer sk_wrong_key-user-win-proj"
+            }, json={
+                "model": "gemini-3.5-flash-lite",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            self.assertEqual(res_bad_auth.status_code, 401)
+
+            # 3. Valid Master Key -> proceeds past auth check (not 401)
+            res_good_auth = self.client.post("/v1/chat/completions", headers={
+                "Authorization": "Bearer sk_horizon_master_secret-user-win-proj"
+            }, json={
+                "model": "unknown-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            self.assertNotEqual(res_good_auth.status_code, 401)
+
     # --- Privacy & Path Doxxing Tests ---
 
     def test_sanitizer_strips_windows_usernames_and_drives(self):
-        # Windows path must hide drive root, username, and keep only the last 3 folders
         dirty_path = r"C:\Users\JohnDoe\Desktop\Private\event_horizon\projects\scanner"
         clean_dir, os_name = analytics.sanitize_path(dirty_path)
 
@@ -83,7 +114,6 @@ class TestAPI(unittest.TestCase):
         self.assertNotIn("C:", clean_dir)
 
     def test_sanitizer_strips_macos_and_linux_user_homes(self):
-        # Mac path should strip /Users/username/ without hardcoding usernames
         mac_path = "/Users/alice_smith/repos/crypto_bot/backend"
         clean_mac, os_mac = analytics.sanitize_path(mac_path)
 
@@ -91,7 +121,6 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(clean_mac, "repos/crypto_bot/backend")
         self.assertNotIn("alice_smith", clean_mac)
 
-        # Linux path should strip /home/username/ and keep the local folder
         linux_path = "/home/deployer/my_custom_project"
         clean_linux, os_linux = analytics.sanitize_path(linux_path)
 
@@ -100,7 +129,6 @@ class TestAPI(unittest.TestCase):
         self.assertNotIn("deployer", clean_linux)
 
     def test_sanitizer_handles_empty_or_scratchpad_paths(self):
-        # Ad-hoc or missing paths should default safely without crashing
         clean_dir, os_name = analytics.sanitize_path("")
         self.assertEqual(clean_dir, "terminal/adhoc")
         self.assertEqual(os_name, "unknown")
@@ -108,7 +136,6 @@ class TestAPI(unittest.TestCase):
     # --- Caller Identification Tests ---
 
     def test_detects_agent_tool_from_semantic_bearer_key(self):
-        # Agent-made tools pass their project key in the Authorization header
         headers = {"Authorization": "Bearer sk-agent_tool-projects/ios_app"}
         caller_type, rough_dir, _ = analytics.detect_caller_and_os(headers, {}, "127.0.0.1")
 
@@ -116,7 +143,6 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(rough_dir, "projects/ios_app")
 
     def test_detects_user_from_custom_project_bearer_key(self):
-        # Your own manual scripts outside OpenCode pass a user key
         headers = {"Authorization": "Bearer sk-user-crypto_bot/trading"}
         caller_type, rough_dir, _ = analytics.detect_caller_and_os(headers, {}, "192.168.1.150")
 
@@ -124,7 +150,6 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(rough_dir, "crypto_bot/trading")
 
     def test_detects_opencode_agent_from_system_prompt(self):
-        # OpenCode agents identify themselves via their system instructions
         body = {
             "messages": [
                 {"role": "system", "content": "You are the builder for one developer. Workspace is projects/ios_test."}
@@ -136,7 +161,6 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(rough_dir, "projects/ios_test")
 
     def test_detects_subtool_via_openai_user_parameter(self):
-        # Standard OpenAI SDK calls passing user='agent_tool:parser'
         body = {"user": "agent_tool:parser"}
         caller_type, rough_dir, _ = analytics.detect_caller_and_os({}, body, "127.0.0.1")
 
