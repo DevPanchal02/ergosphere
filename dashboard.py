@@ -1,43 +1,29 @@
-import os
-import re
 import json
 import time
+import asyncio
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 import config
+import db
 import analytics
 from controller import controller
 from key_manager import key_manager
 
 
-def get_available_log_days() -> List[Dict[str, Any]]:
-    days = set()
+async def get_available_log_days() -> List[Dict[str, Any]]:
+    # Queries distinct day partitions and totals from SQLite, ensuring today is always included
+    entries = await db.get_available_days()
     current_day = controller.get_today_str(time.time())
-    days.add(current_day)
+    day_map = {item["day"]: item for item in entries}
 
-    all_files = analytics.get_all_log_files()
-
-    for path in all_files:
-        base = os.path.basename(path)
-        if m := re.search(r"\d{4}-\d{2}-\d{2}", base):
-            days.add(m.group(0))
-
-    for r in analytics.get_all_rows_cached():
-        if d := analytics.row_day(r):
-            days.add(d)
-
-    results = []
-    for d in sorted(days, reverse=True):
-        day_rows = analytics.read_day_rows(d)
-        if not day_rows and d != current_day:
-            continue
-        cost = sum(float(r.get("cost") or 0.0) for r in day_rows)
-        results.append({"day": d, "cost": cost, "count": len(day_rows)})
-    return results
+    if current_day not in day_map:
+        entries.insert(0, {"day": current_day, "cost": 0.0, "count": 0})
+    return entries
 
 
 def format_tokens(n: float) -> str:
+    # Formats large token numbers into human-readable compact notation (e.g. 15.2k, 1.25M)
     try:
         val = float(n or 0)
     except (ValueError, TypeError):
@@ -49,8 +35,9 @@ def format_tokens(n: float) -> str:
     return f"{int(val):,}" if val.is_integer() else f"{val:.1f}"
 
 
-def render_cli_text(day_str: str) -> str:
-    rows = analytics.read_day_rows(day_str)
+async def render_cli_text(day_str: str) -> str:
+    # Renders formatted CLI text summary for terminal and curl consumers from SQLite rows
+    rows = await db.get_day_requests(day_str)
     by_model, by_caller, by_agent, ranked_tools = analytics.summarize_rows(rows)
     now = time.time()
     controller._roll(now)
@@ -75,16 +62,26 @@ def render_cli_text(day_str: str) -> str:
 
     for k in pool["keys"]:
         fb_str = "[3.1]" if k["fallback"] else "[3.5]"
-        out.append(f"  {k['label']:<4} {fb_str} [{k['status_text']:<8}] RPM={k['rpm_used']}/15 TPM={format_tokens(k['tpm_used'])}/{format_tokens(k['tpm_limit'])} RPD={k['rpd_used']}/500 Errs={k['errs']}")
+        out.append(
+            f"  {k['label']:<4} {fb_str} [{k['status_text']:<8}] "
+            f"RPM={k['rpm_used']}/15 TPM={format_tokens(k['tpm_used'])}/{format_tokens(k['tpm_limit'])} "
+            f"RPD={k['rpd_used']}/500 Errs={k['errs']}"
+        )
 
     out.append("\n--- CALLERS & AGENTS ---")
     for _, b in sorted(by_caller.items(), key=lambda x: x[1]["usd"], reverse=True):
         fail_pct = (b['errors'] / b['reqs'] * 100) if b['reqs'] else 0.0
-        out.append(f"  {b['caller']:<16} {b['dir']:<30} [{b['os']:<7}] reqs={b['reqs']:<4} fail={fail_pct:4.1f}% ${b['usd']:<6.4f} in={format_tokens(b['in'])}")
+        out.append(
+            f"  {b['caller']:<16} {b['dir']:<30} [{b['os']:<7}] "
+            f"reqs={b['reqs']:<4} fail={fail_pct:4.1f}% ${b['usd']:<6.4f} in={format_tokens(b['in'])}"
+        )
 
     out.append("\n--- MODELS BREAKDOWN ---")
     for m, b in sorted(by_model.items(), key=lambda x: x[1]["reqs"], reverse=True):
-        out.append(f"  {m:<28} reqs={b['reqs']:<5} ${b['usd']:<7.4f} in={format_tokens(b['in'])} out={format_tokens(b['out'])} err={b['errors']}")
+        out.append(
+            f"  {m:<28} reqs={b['reqs']:<5} ${b['usd']:<7.4f} "
+            f"in={format_tokens(b['in'])} out={format_tokens(b['out'])} err={b['errors']}"
+        )
 
     out.append("\n--- RANKED TOOL CALLS ---")
     if ranked_tools:
@@ -97,36 +94,54 @@ def render_cli_text(day_str: str) -> str:
     for r in reversed(rows[-8:]):
         c_in_str = f"({format_tokens(r.get('c_in', 0))})" if r.get('c_in') else ""
         c_str = f"{r.get('caller','User')}:{r.get('dir','adhoc')}"
-        out.append(f"  {r.get('ts','?')[11:19]}Z status={r.get('status',200)} {r.get('m','?'):<18} caller={c_str:<24} in={format_tokens(r.get('in',0))}{c_in_str} out={format_tokens(r.get('out',0))} ${float(r.get('cost') or 0):.4f} dur={r.get('dur',0)}s")
+        out.append(
+            f"  {r.get('ts','?')[11:19]}Z status={r.get('status',200)} {r.get('m','?'):<18} "
+            f"caller={c_str:<24} in={format_tokens(r.get('in',0))}{c_in_str} "
+            f"out={format_tokens(r.get('out',0))} ${float(r.get('cost') or 0):.4f} dur={r.get('dur',0)}s"
+        )
 
     err_rows = [r for r in rows if r.get("err") or int(r.get("status") or 200) >= 400]
     out.append(f"\n--- RECENT ERRORS ({min(8, len(err_rows))} of {len(err_rows)}) ---")
     if err_rows:
         for r in reversed(err_rows[-8:]):
             err_msg = str(r.get("err") or "error").replace("\n", " ")[:60]
-            out.append(f"  {r.get('ts','?')[11:19]}Z status={r.get('status',500)} {r.get('m','?'):<18} key={r.get('key','-')} | {err_msg}")
+            out.append(
+                f"  {r.get('ts','?')[11:19]}Z status={r.get('status',500)} {r.get('m','?'):<18} "
+                f"key={r.get('key','-')} | {err_msg}"
+            )
     else:
         out.append("  (no errors recorded for this day)")
 
     return "\n".join(out) + "\n"
 
 
-def render_html_dashboard(selected_day: Optional[str] = None) -> str:
+async def render_html_dashboard(selected_day: Optional[str] = None) -> str:
+    # Renders responsive cockpit dashboard using indexed SQLite telemetry
     now = time.time()
     today_str = controller.get_today_str(now)
     active_day = selected_day or today_str
-    day_entries = get_available_log_days()
 
-    rows = analytics.read_day_rows(active_day)
+    # Fetch daily telemetry rows and available day partitions
+    day_entries = await get_available_log_days()
+    rows = await db.get_day_requests(active_day)
     by_model, by_caller, by_agent, ranked_tools = analytics.summarize_rows(rows)
     pool_status = key_manager.get_pool_status(now)
 
     total_reqs = len(rows)
     total_spend = sum(float(r.get("cost") or 0.0) for r in rows)
-    active_rpm = analytics.get_rolling_rpm(rows, now) if active_day == today_str else 0
+
+    # Compute rolling RPM from SQLite
+    if active_day == today_str:
+        cutoff_iso = datetime.fromtimestamp(now - 60.0, config.TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            active_rpm = await db.get_rolling_rpm(today_str, cutoff_iso)
+        except Exception:
+            active_rpm = 0
+    else:
+        active_rpm = 0
 
     max_rpd_pool = len(key_manager.keys) * key_manager.rpd_limit
-    gemini_day_calls = sum(1 for r in rows if r.get("key", "").startswith("G"))
+    gemini_day_calls = sum(1 for r in rows if (r.get("key") or "").startswith("G"))
     rpd_pct = (gemini_day_calls / max(1, max_rpd_pool)) * 100
 
     dt = datetime.fromtimestamp(now, config.TZ)
@@ -140,15 +155,15 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     dropdown_items_html = []
     for item in day_entries:
         d = item["day"]
-        cost_str = f"${item['cost']:.4f}"
+        cost_str = f"${float(item.get('cost') or 0.0):.4f}"
         date_label = "Today" if d == today_str else d
         is_active = (d == active_day)
-        dropdown_items_html.append(f'''
+        dropdown_items_html.append(f"""
           <div class="dropdown-item {'active' if is_active else ''}" onclick="changeDay('{d}')">
             <span class="d-date">{date_label}</span>
             <span class="d-cost">{cost_str}</span>
           </div>
-        ''')
+        """)
 
     initial_payload = {
         "active_day": active_day,
@@ -159,8 +174,8 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
             "day_usd": round(total_spend, 4),
             "daily_cap": controller.daily_cap,
             "run_usd": controller.ledger["run_usd"],
-            "run_cap": controller.run_cap
-        }
+            "run_cap": controller.run_cap,
+        },
     }
 
     return f"""<!DOCTYPE html>
@@ -361,7 +376,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
     }}
     .table-fill::-webkit-scrollbar {{ width: 4px; height: 4px; }}
     .table-fill::-webkit-scrollbar-thumb {{ background: #1e293b; border-radius: 2px; }}
-    
+
     .os-badge {{ font-size: 9px; padding: 1px 4px; border-radius: 2px; background: #1e293b; color: var(--cyan); text-transform: uppercase; font-weight: 700; }}
     .caller-badge {{ font-size: 9.5px; padding: 1px 5px; border-radius: 2px; font-weight: 700; text-transform: uppercase; }}
     .caller-agent {{ background: rgba(192, 132, 252, 0.15); color: var(--purple); border: 1px solid rgba(192, 132, 252, 0.4); }}
@@ -375,7 +390,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
   <div class="top-bar">
     <div class="brand">
       <span>⚡ HORIZON PROXY</span>
-      
+
       <div class="dropdown">
         <button class="dropdown-trigger" onclick="toggleDropdown(event)">
           <span>{active_button_label}</span>
@@ -401,7 +416,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
   </div>
 
   <div class="cockpit-layout">
-    
+
     <!-- LEFT SIDEBAR: EXPANDED 2-COLUMN FLEET -->
     <aside class="bento-card" style="height: 100%;">
       <div class="card-head">
@@ -412,7 +427,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       <div class="balancer-card">
         <div class="bal-row">
           <span class="bal-title">EQUATION</span>
-          <span class="bal-val" style="color:var(--cyan); font-size:9.5px;">max(RPM, TPM) → Least RPD</span>
+          <span class="bal-val" style="color:var(--cyan); font-size:9.5px;">max(RPM, TPM) -> Least RPD</span>
         </div>
         <div class="bal-row">
           <span class="bal-title">NEXT CANDIDATE</span>
@@ -425,8 +440,8 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
     <!-- RIGHT MAIN: MODELS, CALLERS, REQUESTS & ERRORS SIDE-BY-SIDE -->
     <main class="main-workspace">
-      
-      <!-- Row 1: Models & Ranked Tools (Max 130px) -->
+
+      <!-- Row 1: Models & Ranked Tools -->
       <div class="grid-2col" style="flex-shrink: 0; max-height: 130px;">
         <div class="bento-card" style="height: 100%;">
           <div class="card-head">
@@ -472,7 +487,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <!-- Row 2: Callers & Agents (Separate Type, Directory, OS columns) -->
+      <!-- Row 2: Callers & Agents -->
       <div class="bento-card" style="flex-shrink: 0; max-height: 125px;">
         <div class="card-head">
           <span>Callers, Projects & Execution Scope</span>
@@ -498,9 +513,9 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         </div>
       </div>
 
-      <!-- Row 3: Requests & Errors Side-by-Side (1:1 Equal Width) -->
+      <!-- Row 3: Requests & Errors Side-by-Side -->
       <div class="grid-2col-equal" style="flex: 1; min-height: 0;">
-        
+
         <!-- Recent Requests -->
         <div class="bento-card" style="height: 100%;">
           <div class="card-head">
@@ -715,18 +730,18 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       const toolCounts = {{}};
 
       rows.forEach(r => {{
-        const m = r.m || 'unknown';
-        const c_type = r.caller || 'User';
-        const c_dir = r.dir || 'adhoc';
-        const c_os = r.os || 'unknown';
+        const m = r.m || r.model_requested || 'unknown';
+        const c_type = r.caller || r.caller_type || 'User';
+        const c_dir = r.dir || r.caller_dir || 'adhoc';
+        const c_os = r.os || r.caller_os || 'unknown';
         const callerKey = `${{c_type}}::${{c_dir}}`;
 
-        const cost = parseFloat(r.cost || 0);
-        const p_in = parseInt(r.in || 0);
-        const p_cin = parseInt(r.c_in || 0);
-        const p_out = parseInt(r.out || 0);
-        const p_rout = parseInt(r.r_out || 0);
-        const isErr = r.err || parseInt(r.status || 200) >= 400;
+        const cost = parseFloat(r.cost || r.cost_usd || 0);
+        const p_in = parseInt(r.in || r.tokens_prompt_total || 0);
+        const p_cin = parseInt(r.c_in || r.tokens_prompt_cached || 0);
+        const p_out = parseInt(r.out || r.tokens_completion || 0);
+        const p_rout = parseInt(r.r_out || r.tokens_reasoning || 0);
+        const isErr = r.err || r.error_message || parseInt(r.status || r.status_code || 200) >= 400;
 
         if (!byModel[m]) byModel[m] = {{ reqs: 0, usd: 0, in: 0, cin: 0, out: 0, rout: 0, errs: 0 }};
         byModel[m].reqs++;
@@ -744,7 +759,11 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
         byCaller[callerKey].out += p_out;
         if (isErr) byCaller[callerKey].errs++;
 
-        (r.tools_called || []).forEach(t => {{
+        let called = r.tools_called || [];
+        if (typeof called === 'string') {{
+          try {{ called = JSON.parse(called); }} catch(e) {{ called = []; }}
+        }}
+        called.forEach(t => {{
           if (t && t !== '?') toolCounts[t] = (toolCounts[t] || 0) + 1;
         }});
       }});
@@ -807,41 +826,57 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
       const recentReqs = rows.slice(-depthConfig.req).reverse();
       reqTbody.innerHTML = recentReqs.length ? recentReqs.map(r => {{
         const ht = formatHumanTime(r.ts);
-        const inStr = `${{formatTok(r.in || 0)}} <small style="color:var(--text-muted);">(${{formatTok(r.c_in || 0)}})</small>`;
-        const c_type = r.caller || 'User';
-        const c_dir = r.dir || 'adhoc';
+        const p_in = r.in || r.tokens_prompt_total || 0;
+        const p_cin = r.c_in || r.tokens_prompt_cached || 0;
+        const inStr = `${{formatTok(p_in)}} <small style="color:var(--text-muted);">(${{formatTok(p_cin)}})</small>`;
+        const c_type = r.caller || r.caller_type || 'User';
+        const c_dir = r.dir || r.caller_dir || 'adhoc';
+        const c_os = r.os || r.caller_os || '?';
+        const m = r.m || r.model_requested || '';
+        const key = r.key || r.key_label || '-';
+        const status = r.status || r.status_code || 200;
+        const cost = parseFloat(r.cost || r.cost_usd || 0);
+        const dur = r.dur || r.duration_total_s || 0;
+
         return `
           <tr>
             <td style="color:var(--text-muted);"><b>${{ht.time}}</b> <small>(${{ht.rel}})</small></td>
-            <td class="${{r.status < 400 ? 'status-ok' : 'status-err'}}">${{r.status || 200}}</td>
-            <td style="max-width:105px; overflow:hidden; text-overflow:ellipsis;" title="${{r.m || ''}}">${{(r.m || '').split('/').pop()}}</td>
+            <td class="${{status < 400 ? 'status-ok' : 'status-err'}}">${{status}}</td>
+            <td style="max-width:105px; overflow:hidden; text-overflow:ellipsis;" title="${{m}}">${{m.split('/').pop()}}</td>
             <td>${{getCallerBadge(c_type)}}</td>
-            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;" title="${{c_dir}}"><span class="os-badge">${{r.os || '?'}}</span> ${{c_dir}}</td>
-            <td><strong style="color:var(--green);">${{r.key || '-'}}</strong></td>
+            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;" title="${{c_dir}}"><span class="os-badge">${{c_os}}</span> ${{c_dir}}</td>
+            <td><strong style="color:var(--green);">${{key}}</strong></td>
             <td class="mono-num">${{inStr}}</td>
-            <td class="mono-num">${{formatTok(r.out || 0)}}</td>
-            <td class="mono-num" style="color:var(--cyan);">$${{parseFloat(r.cost || 0).toFixed(4)}}</td>
-            <td class="mono-num">${{r.dur || 0}}s</td>
+            <td class="mono-num">${{formatTok(r.out || r.tokens_completion || 0)}}</td>
+            <td class="mono-num" style="color:var(--cyan);">$${{cost.toFixed(4)}}</td>
+            <td class="mono-num">${{dur}}s</td>
           </tr>
         `;
       }}).join('') : '<tr><td colspan="10" style="text-align:center; color:var(--text-muted);">No requests recorded</td></tr>';
 
-      const errRows = rows.filter(r => r.err || parseInt(r.status || 200) >= 400);
+      const errRows = rows.filter(r => r.err || r.error_message || parseInt(r.status || r.status_code || 200) >= 400);
       const recentErrs = errRows.slice(-depthConfig.err).reverse();
       errTbody.innerHTML = recentErrs.length ? recentErrs.map(r => {{
         const ht = formatHumanTime(r.ts);
-        const c_type = r.caller || 'User';
-        const c_dir = r.dir || 'adhoc';
+        const c_type = r.caller || r.caller_type || 'User';
+        const c_dir = r.dir || r.caller_dir || 'adhoc';
+        const c_os = r.os || r.caller_os || '?';
+        const m = r.m || r.model_requested || '';
+        const key = r.key || r.key_label || '-';
+        const status = r.status || r.status_code || 500;
+        const err_desc = r.err || r.error_message || 'Error';
+        const dur = r.dur || r.duration_total_s || 0;
+
         return `
           <tr>
             <td style="color:var(--text-muted);"><b>${{ht.time}}</b> <small>(${{ht.rel}})</small></td>
-            <td class="status-err">${{r.status || 500}}</td>
-            <td style="max-width:105px; overflow:hidden; text-overflow:ellipsis;" title="${{r.m || ''}}">${{(r.m || '').split('/').pop()}}</td>
+            <td class="status-err">${{status}}</td>
+            <td style="max-width:105px; overflow:hidden; text-overflow:ellipsis;" title="${{m}}">${{m.split('/').pop()}}</td>
             <td>${{getCallerBadge(c_type)}}</td>
-            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;" title="${{c_dir}}"><span class="os-badge">${{r.os || '?'}}</span> ${{c_dir}}</td>
-            <td><strong style="color:var(--red);">${{r.key || '-'}}</strong></td>
-            <td style="color:var(--red); max-width:170px; overflow:hidden; text-overflow:ellipsis;" title="${{r.err || 'Error'}}">${{r.err || 'Error'}}</td>
-            <td class="mono-num">${{r.dur || 0}}s</td>
+            <td style="max-width:130px; overflow:hidden; text-overflow:ellipsis;" title="${{c_dir}}"><span class="os-badge">${{c_os}}</span> ${{c_dir}}</td>
+            <td><strong style="color:var(--red);">${{key}}</strong></td>
+            <td style="color:var(--red); max-width:170px; overflow:hidden; text-overflow:ellipsis;" title="${{err_desc}}">${{err_desc}}</td>
+            <td class="mono-num">${{dur}}s</td>
           </tr>
         `;
       }}).join('') : '<tr><td colspan="8" style="text-align:center; color:var(--text-muted);">No errors recorded</td></tr>';
@@ -904,7 +939,7 @@ def render_html_dashboard(selected_day: Optional[str] = None) -> str:
 
           if (data.type === "telemetry" && data.row) {{
             INITIAL_DATA.rows.push(data.row);
-            const gemCalls = INITIAL_DATA.rows.filter(r => (r.key || '').startsWith('G')).length;
+            const gemCalls = INITIAL_DATA.rows.filter(r => (r.key || r.key_label || '').startsWith('G')).length;
             const rpdEl = document.getElementById("val-rpd-calls");
             if (rpdEl) rpdEl.textContent = gemCalls.toLocaleString();
             renderSummaryTables();
