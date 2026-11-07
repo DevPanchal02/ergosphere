@@ -2,62 +2,130 @@ import os
 import re
 import json
 import time
+import hashlib
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional, Tuple, Dict, Any, List
 
 import config
 
-# In-memory cache for parsed log rows: path -> {"mtime": mtime, "size": size, "rows": [...]}
+# In-memory file cache maintained for backwards compatibility with legacy file readers
 _FILE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def sanitize_path(raw_path: str) -> Tuple[str, str]:
     """
-    Dynamically strips OS drive prefixes and user home directories WITHOUT any hardcoded folder names.
-    Applies a 2-3 segment sliding window so parent directory hierarchies are never doxxed.
-    Returns: (rough_directory, detected_os)
+    Dynamically strips drive letters, WSL mount roots, and arbitrary user home directories.
+    Applies a 3-directory sliding window and trims trailing file extensions so personal
+    filesystem hierarchies are never logged.
+    Returns: (sanitized_directory, detected_os)
     """
     if not raw_path or raw_path.strip() in ("", "-", "unknown", "none"):
         return "terminal/adhoc", "unknown"
 
     raw = raw_path.strip().replace("\\", "/")
 
-    # 1. OS Detection from path syntax
+    # Detect operating system from path syntax signatures
     detected_os = "unknown"
     if re.match(r"^[A-Za-z]:", raw_path) or "\\" in raw_path:
         detected_os = "windows"
-    elif raw.startswith("/Users/"):
+    elif raw.startswith(("/mnt/", "mnt/")):
+        detected_os = "wsl"
+    elif raw.startswith(("/Users/", "Users/")):
         detected_os = "macos"
-    elif raw.startswith(("/home/", "/root/")):
+    elif raw.startswith(("/home/", "/root/", "home/", "root/")):
         detected_os = "linux"
+    elif raw.startswith(("/workspace/", "workspace/", "/app/", "app/")):
+        detected_os = "docker"
 
-    # 2. Dynamic Home/User Directory Stripping (Works on any username/drive)
-    # Strips 'C:/Users/<username>/', '/Users/<username>/', '/home/<username>/', '/root/'
-    cleaned = re.sub(r"^[A-Za-z]:/(?:Users|home)/[^/]+/", "", raw, flags=re.IGNORECASE)
-    cleaned = re.sub(r"^/(?:Users|home)/[^/]+/", "", cleaned)
-    cleaned = re.sub(r"^/root/", "", cleaned)
+    # Strip Windows drive letters (e.g., 'C:/')
+    cleaned = re.sub(r"^[A-Za-z]:/", "", raw, flags=re.IGNORECASE)
+
+    # Strip WSL mount points (e.g., '/mnt/c/' or 'mnt/c/')
+    cleaned = re.sub(r"^/?mnt/[A-Za-z]/", "", cleaned, flags=re.IGNORECASE)
+
+    # Strip dynamic user homes without hardcoding usernames (e.g., '/Users/john/', '/home/ubuntu/')
+    cleaned = re.sub(r"^/?(?:Users|home)/[^/]+/", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^/?root/", "", cleaned)
     cleaned = cleaned.lstrip("/")
 
-    # 3. Dynamic Sliding Window: Keep the last 2 to 3 meaningful directory segments
-    parts = [p for p in cleaned.split("/") if p and p not in (".", "..")]
-    if len(parts) >= 3:
-        rough_dir = "/".join(parts[-3:])
-    elif len(parts) > 0:
-        rough_dir = "/".join(parts)
+    # Tokenize path into meaningful folder segments
+    segments = [p for p in cleaned.split("/") if p and p not in (".", "..")]
+
+    # Trim file name if the final segment has a file extension (e.g., 'server.py' -> popped)
+    if segments and re.search(r"^[^.].*\.[a-zA-Z0-9]{1,8}$", segments[-1]):
+        segments.pop()
+
+    # Apply 3-directory sliding window: keep at most the last 3 directories
+    if len(segments) >= 3:
+        rough_dir = "/".join(segments[-3:])
+    elif len(segments) > 0:
+        rough_dir = "/".join(segments)
     else:
-        rough_dir = "root"
+        rough_dir = "root" if detected_os != "unknown" else "terminal/adhoc"
 
     return rough_dir, detected_os
 
 
+# Alias for backward compatibility with older test suites
+sanitize_caller = sanitize_path
+
+
+def parse_bearer_token(auth_header: str, master_key: Optional[str] = None) -> Tuple[bool, str, str, str]:
+    """
+    Extracts (is_valid, caller_role, os_hint, raw_project_path) from Authorization Bearer token.
+    Format: Bearer <MASTER_KEY>-<caller/role>-<os>-<project> or Bearer sk-<role>-<path>
+    """
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return False, "", "", ""
+
+    raw_token = auth_header[7:].strip()
+
+    # Verify Master Key secret prefix if configured in environment
+    if master_key:
+        if not raw_token.startswith(master_key):
+            return False, "", "", ""
+        metadata_payload = raw_token[len(master_key):].lstrip("-_")
+    else:
+        metadata_payload = raw_token.removeprefix("Bearer ").strip()
+        if metadata_payload.lower().startswith("sk-"):
+            metadata_payload = metadata_payload[3:]
+
+    if not metadata_payload:
+        return True, "User", "", ""
+
+    # Split positional metadata: up to 3 parts (caller, os, project_path)
+    parts = metadata_payload.split("-", 2)
+    caller_role = parts[0] if len(parts) > 0 else ""
+    os_hint = parts[1] if len(parts) > 1 else ""
+    raw_project_path = parts[2] if len(parts) > 2 else ""
+
+    # If only 2 parts were provided, the second part is treated as the project path
+    if len(parts) == 2:
+        raw_project_path = parts[1]
+        os_hint = ""
+
+    return True, caller_role, os_hint, raw_project_path
+
+
+def verify_master_key(auth_header: str) -> bool:
+    """Verifies that the incoming Authorization header satisfies MASTER_KEY requirements."""
+    if not config.MASTER_KEY:
+        return True
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return False
+    token = auth_header[7:].strip()
+    return token.startswith(config.MASTER_KEY)
+
+
 def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[str, str, str]:
     """
-    Extracts (caller_type, rough_directory, detected_os) across all scenarios:
-      - OpenCode Agents (builder, planner, scout, reviewer)
-      - Agent-made tools running in test loops or standalone
-      - Manual user projects outside OpenCode
-      - Ad-hoc curl / terminal calls
+    Dynamically identifies (caller_type, caller_dir, caller_os) across all callers:
+      1. Bearer token metadata
+      2. OpenAI standard 'user' parameter
+      3. Explicit X- headers
+      4. Dynamic OpenCode system prompt regex sniffer
+      5. Network origin (Docker sandbox vs Host vs LAN)
     """
     h = {k.lower(): v for k, v in headers.items()}
     auth = h.get("authorization", "")
@@ -68,41 +136,34 @@ def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[s
     raw_path = ""
     os_hint = "unknown"
 
-    # 1. Check Bearer Token (sk-<type>-<path> or sk-<os>-<project>)
-    if "bearer " in auth.lower():
-        raw_token = auth[auth.lower().index("bearer ") + 7:].strip()
-        if raw_token.lower().startswith("sk-"):
-            raw_token = raw_token[3:]
-
-        parts = raw_token.split("-")
-        first = parts[0].lower() if parts else ""
-
-        if first in ("agent_tool", "tool"):
+    # 1. Parse Bearer Token metadata
+    _, b_caller, b_os, b_path = parse_bearer_token(auth, config.MASTER_KEY)
+    if b_caller:
+        c_low = b_caller.lower()
+        if c_low in ("agent_tool", "agent-tool", "tool"):
             caller_type = "Agent-Tool"
-            raw_path = "-".join(parts[1:])
-        elif first == "agent":
-            if len(parts) > 2 and parts[1].lower() in ("builder", "planner", "scout", "explorer", "reviewer", "coder"):
-                caller_type = f"Agent:{parts[1].lower()}"
-                raw_path = "-".join(parts[2:])
-            else:
-                caller_type = "Agent"
-                raw_path = "-".join(parts[1:])
-        elif first == "user":
+        elif c_low.startswith(("agent:", "agent_", "agent-")):
+            role_name = re.sub(r"^agent[:_\-]", "", c_low)
+            caller_type = f"Agent:{role_name}"
+        elif c_low == "agent":
+            caller_type = "Agent"
+        elif c_low == "user":
             caller_type = "User"
-            raw_path = "-".join(parts[1:])
-        elif first in ("mac", "darwin"):
-            os_hint = "macos"
-            raw_path = "-".join(parts[1:])
-        elif first in ("pc", "win", "windows"):
+        elif c_low in ("win", "windows", "pc"):
             os_hint = "windows"
-            raw_path = "-".join(parts[1:])
-        elif first in ("linux", "wsl"):
+        elif c_low in ("mac", "macos", "darwin"):
+            os_hint = "macos"
+        elif c_low in ("linux", "wsl"):
             os_hint = "linux"
-            raw_path = "-".join(parts[1:])
-        else:
-            raw_path = raw_token
+        elif c_low == "docker":
+            os_hint = "docker"
 
-    # 2. Check Standard OpenAI "user" field
+    if b_os:
+        os_hint = b_os.lower()
+    if b_path:
+        raw_path = b_path
+
+    # 2. Check OpenAI standard 'user' parameter
     if user_param:
         if ":" in user_param:
             prefix, path_val = user_param.split(":", 1)
@@ -111,20 +172,17 @@ def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[s
                 caller_type = "Agent-Tool"
             elif "agent" in p_low:
                 caller_type = "Agent"
-            else:
-                caller_type = "User"
             raw_path = path_val
         else:
             if caller_type == "User":
                 raw_path = user_param
-            else:
-                raw_path = f"{raw_path}/{user_param}" if raw_path else user_param
+            elif not raw_path:
+                raw_path = user_param
 
-    # 3. Explicit Headers (if present)
+    # 3. Explicit headers
     explicit_path = (
         h.get("x-caller-path") or
         h.get("x-project-dir") or
-        h.get("x-file-path") or
         h.get("x-workspace-path") or
         h.get("x-project-path") or
         ""
@@ -137,44 +195,100 @@ def detect_caller_and_os(headers: dict, body: dict, client_host: str) -> Tuple[s
     elif h.get("x-agent-role") or h.get("x-opencode-agent"):
         caller_type = f"Agent:{h.get('x-agent-role') or h.get('x-opencode-agent')}"
 
-    # 4. OpenCode System Prompt Sniffing (For meta-agent loops)
+    # 4. OpenCode dynamic system prompt sniffer: extracts roles like 'Agent:builder', 'Agent:qa-tester'
     for msg in (body.get("messages") or []):
         if isinstance(msg, dict) and msg.get("role") in ("system", "user"):
-            content = str(msg.get("content") or "").lower()
-            for role in ("builder", "planner", "scout", "explorer", "reviewer", "coder"):
-                if f"you are the {role}" in content or f"you are a {role}" in content:
-                    caller_type = f"Agent:{role}"
-                    break
+            content = str(msg.get("content") or "")
+            # Sniff role name, allowing optional qualifying adjectives like 'experienced', 'senior', 'lead'
+            m_role = re.search(
+                r"you are (?:a|an|the)\s+(?:(?:experienced|senior|lead|expert|principal)\s+)?([a-zA-Z0-9_\-]+)",
+                content,
+                re.IGNORECASE,
+            )
+            if m_role and caller_type in ("User", "Agent"):
+                extracted = m_role.group(1).lower()
+                caller_type = f"Agent:{extracted}"
 
-            # Extract relative project directory mentioned in prompt if raw_path is still empty
+            # Extract relative project workspace if not yet specified
             if not raw_path:
-                m = re.search(r"(?:projects|workspace|repos)/([a-zA-Z0-9_\-\./]+)", content)
-                if m:
-                    raw_path = m.group(0).rstrip("/.")
+                m_proj = re.search(r"(?:projects|workspace|repos)/([a-zA-Z0-9_\-\./]+)", content)
+                if m_proj:
+                    raw_path = m_proj.group(0).rstrip("/.")
 
-    # 5. OS Detection from Client Environment / Network
+    # 5. OS detection fallback ladder: User-Agent and network origin
     if h.get("x-client-os") or h.get("x-host-os"):
         os_hint = (h.get("x-client-os") or h.get("x-host-os")).lower()
-    elif "darwin" in user_agent or "macintosh" in user_agent or "mac os" in user_agent:
+    elif "darwin" in user_agent or "macintosh" in user_agent:
         os_hint = "macos"
     elif "windows" in user_agent:
         os_hint = "windows"
     elif "linux" in user_agent:
         os_hint = "linux"
 
-    # Sanitize directory path without hardcoded safe-folders
-    rough_dir, path_os = sanitize_path(raw_path)
+    # Sanitize path hierarchy
+    sanitized_dir, path_os = sanitize_path(raw_path)
 
+    # Determine final operating system
     final_os = path_os if path_os != "unknown" else os_hint
     if final_os == "unknown":
-        if client_host in ("127.0.0.1", "localhost", "host.docker.internal"):
+        if client_host in ("127.0.0.1", "localhost", "::1"):
             final_os = "windows"
-        else:
+        elif client_host.startswith("172."):
+            final_os = "docker"
+        elif client_host.startswith(("192.168.", "10.")):
             final_os = "macos"
 
-    return caller_type, rough_dir, final_os
+    return caller_type, sanitized_dir, final_os
+
+
+def derive_request_context(headers: dict, body: dict) -> Tuple[str, int, Dict[str, int]]:
+    """
+    Derives deterministic session ID, turn index counter, and tokens partitioned by message role.
+    """
+    h = {k.lower(): v for k, v in headers.items()}
+    messages = body.get("messages") or []
+
+    # 1. Derive Session ID from headers or root prompt hash
+    session_id = h.get("x-session-id") or h.get("x-conversation-id")
+    if not session_id:
+        root_content = ""
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") in ("system", "user"):
+                root_content += str(m.get("content") or "")
+                if len(root_content) > 300:
+                    break
+        if root_content:
+            session_id = hashlib.sha256(root_content.encode("utf-8")).hexdigest()[:16]
+        else:
+            session_id = "adhoc-session"
+
+    # 2. Derive Turn Index: count completed user questions and tool turns
+    turn_index = sum(1 for m in messages if isinstance(m, dict) and m.get("role") in ("user", "tool"))
+
+    # 3. Partition Prompt Tokens by Role (system, user, assistant, tool)
+    tokens_by_role = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
+    try:
+        import litellm
+        for m in messages:
+            if isinstance(m, dict):
+                role = m.get("role", "user")
+                target_role = role if role in tokens_by_role else "user"
+                tok_count = litellm.token_counter(model=config.PRIMARY_GEMINI_MODEL, messages=[m])
+                tokens_by_role[target_role] += tok_count
+    except Exception:
+        # Fallback character approximation (approx 4 chars per token)
+        for m in messages:
+            if isinstance(m, dict):
+                role = m.get("role", "user")
+                target_role = role if role in tokens_by_role else "user"
+                content_len = len(str(m.get("content") or ""))
+                tokens_by_role[target_role] += max(1, content_len // 4)
+
+    return session_id, turn_index, tokens_by_role
+
 
 def clean_error_message(msg: str) -> str:
+    """Cleans raw upstream provider errors into concise diagnostic status messages."""
     clean = config.scrub(str(msg))
     if "401" in clean or "403" in clean:
         return "401/403: Invalid/Revoked API Key"
@@ -195,149 +309,8 @@ def clean_error_message(msg: str) -> str:
     return clean.split("\n")[0][:120]
 
 
-def row_day(entry: dict) -> Optional[str]:
-    ts_str = entry.get("ts")
-    if not ts_str:
-        return None
-    try:
-        if ts_str.endswith("Z"):
-            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        else:
-            dt = datetime.fromisoformat(ts_str)
-        return dt.astimezone(config.TZ).strftime("%Y-%m-%d")
-    except Exception:
-        return ts_str[:10]
-
-
-def row_timestamp(entry: dict) -> float:
-    ts_str = entry.get("ts")
-    if not ts_str:
-        return 0.0
-    try:
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        return dt.timestamp()
-    except Exception:
-        return 0.0
-
-
-def get_all_log_files() -> List[str]:
-    found = []
-    for root, dirs, files in os.walk(config.LOGS_DIR):
-        if "incidents" in root:
-            continue
-        for f in files:
-            if f.endswith(".jsonl") or (f.startswith("diagnostics") and not f.endswith(".tmp") and not f.endswith(".json")):
-                found.append(os.path.join(root, f))
-    return sorted(found)
-
-
-def get_today_log_path(day_str: str) -> str:
-    return os.path.join(config.LOGS_DIR, f"diagnostics_{day_str}.jsonl")
-
-
-def log_diagnostic(entry: dict):
-    local_day = row_day(entry) or datetime.now(config.TZ).strftime("%Y-%m-%d")
-    target_path = get_today_log_path(local_day)
-    try:
-        line = json.dumps(entry, separators=(",", ":"))
-        with open(target_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError as e:
-        config.log.warning("Could not write diagnostic row: %s", e)
-
-
-def capture_incident_payload(rid: str, cost: float, prompt_tokens: int, payload: dict):
-    if cost < config.HIGH_COST_THRESHOLD_USD and prompt_tokens < config.HIGH_TOKEN_THRESHOLD:
-        return
-
-    day_str = datetime.now(config.TZ).strftime("%Y-%m-%d")
-    target_dir = os.path.join(config.INCIDENTS_DIR, day_str)
-    os.makedirs(target_dir, exist_ok=True)
-
-    file_name = f"{rid}_usd{cost:.3f}_tok{prompt_tokens}.json"
-    file_path = os.path.join(target_dir, file_name)
-    try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        config.log.info("Incident blackbox saved: %s (cost=$%.4f, tokens=%d)", file_name, cost, prompt_tokens)
-    except OSError as e:
-        config.log.warning("Could not save incident payload: %s", e)
-
-
-def get_all_rows_cached() -> List[dict]:
-    all_files = get_all_log_files()
-    combined_rows = []
-    seen = set()
-
-    for path in all_files:
-        try:
-            stat = os.stat(path)
-            size, mtime = stat.st_size, stat.st_mtime
-            cached = _FILE_CACHE.get(path)
-
-            if cached and cached["size"] == size and cached["mtime"] == mtime:
-                rows = cached["rows"]
-            else:
-                rows = []
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        if stripped := line.strip():
-                            try:
-                                rows.append(json.loads(stripped))
-                            except ValueError:
-                                continue
-                _FILE_CACHE[path] = {"size": size, "mtime": mtime, "rows": rows}
-
-            for r in rows:
-                key = (r.get("ts"), r.get("rid"))
-                if key not in seen:
-                    seen.add(key)
-                    combined_rows.append(r)
-        except OSError:
-            continue
-
-    combined_rows.sort(key=lambda r: r.get("ts", ""))
-    return combined_rows
-
-
-def read_day_rows(day_str: str) -> list[dict]:
-    all_rows = get_all_rows_cached()
-    matched = [r for r in all_rows if row_day(r) == day_str]
-
-    if not matched:
-        all_files = get_all_log_files()
-        seen_keys = set()
-        for path in all_files:
-            if day_str in os.path.basename(path):
-                cached = _FILE_CACHE.get(path)
-                rows = cached["rows"] if cached else []
-                if not rows:
-                    try:
-                        with open(path, "r", encoding="utf-8", errors="replace") as f:
-                            for line in f:
-                                if stripped := line.strip():
-                                    try:
-                                        rows.append(json.loads(stripped))
-                                    except ValueError:
-                                        continue
-                    except OSError:
-                        continue
-                for r in rows:
-                    key = (r.get("ts"), r.get("rid"))
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        matched.append(r)
-
-    matched.sort(key=lambda r: r.get("ts", ""))
-    return matched
-
-
-def get_rolling_rpm(rows: list[dict], now: float) -> int:
-    cutoff = now - 60.0
-    return sum(1 for r in rows if row_timestamp(r) >= cutoff)
-
-
 def parse_usage_and_cost(usage_obj: Any, target_model: str) -> dict:
+    """Parses prompt, cached, completion, and reasoning tokens, computing cost via PRICING ledger."""
     if not usage_obj:
         return {"in": 0, "c_in": 0, "out": 0, "r_out": 0, "cost": 0.0}
 
@@ -370,6 +343,7 @@ def parse_usage_and_cost(usage_obj: Any, target_model: str) -> dict:
 
 
 def summarize_rows(rows: list[dict]):
+    """Aggregates request telemetry across models, callers, and tool invocations."""
     by_model = defaultdict(lambda: {"reqs": 0, "usd": 0.0, "in": 0, "cached": 0, "out": 0, "reasoning": 0, "errors": 0})
     by_caller = defaultdict(lambda: {
         "reqs": 0, "usd": 0.0, "in": 0, "out": 0, "errors": 0,
@@ -379,32 +353,22 @@ def summarize_rows(rows: list[dict]):
     tool_counts = defaultdict(int)
 
     for r in rows:
-        m = r.get("m", "unknown")
-        
-        # Backwards-compatible extraction
-        caller_type = r.get("caller") or "User"
-        caller_dir = r.get("dir")
-        caller_os = r.get("os") or "unknown"
-        if not caller_dir:
-            # If an old log format exists without 'dir', sanitize it now
-            s_dir, s_os = sanitize_path(caller_type)
-            caller_dir = s_dir
-            if caller_os == "unknown":
-                caller_os = s_os
-            caller_type = "Agent" if "agent" in str(r.get("caller")).lower() else "User"
-
+        m = r.get("m") or r.get("model_requested") or "unknown"
+        caller_type = r.get("caller") or r.get("caller_type") or "User"
+        caller_dir = r.get("dir") or r.get("caller_dir") or "adhoc"
+        caller_os = r.get("os") or r.get("caller_os") or "unknown"
         caller_key = f"{caller_type}::{caller_dir}"
 
         names = r.get("tool_names") or []
         sig = ",".join(names[:3]) + ("..." if len(names) > 3 else "") if names else f"{r.get('tools_in', 0)} tools"
         agent_key = f"{m} | {sig}"
 
-        is_err = bool(r.get("err")) or int(r.get("status") or 200) >= 400
-        cost = float(r.get("cost") or 0.0)
-        p_in = int(r.get("in") or 0)
-        p_cin = int(r.get("c_in") or 0)
-        p_out = int(r.get("out") or 0)
-        p_rout = int(r.get("r_out") or 0)
+        is_err = bool(r.get("err") or r.get("error_message")) or int(r.get("status") or r.get("status_code") or 200) >= 400
+        cost = float(r.get("cost") or r.get("cost_usd") or 0.0)
+        p_in = int(r.get("in") or r.get("tokens_prompt_total") or 0)
+        p_cin = int(r.get("c_in") or r.get("tokens_prompt_cached") or 0)
+        p_out = int(r.get("out") or r.get("tokens_completion") or 0)
+        p_rout = int(r.get("r_out") or r.get("tokens_reasoning") or 0)
 
         for b in (by_model[m], by_agent[agent_key]):
             b["reqs"] += 1
@@ -427,9 +391,74 @@ def summarize_rows(rows: list[dict]):
         if is_err:
             bc["errors"] += 1
 
-        for t in r.get("tools_called") or []:
+        tools_called = r.get("tools_called") or []
+        if isinstance(tools_called, str):
+            try:
+                tools_called = json.loads(tools_called)
+            except Exception:
+                tools_called = []
+        for t in tools_called:
             if t and t != "?":
                 tool_counts[t] += 1
 
     ranked_tools = sorted(tool_counts.items(), key=lambda item: item[1], reverse=True)
     return dict(by_model), dict(by_caller), dict(by_agent), ranked_tools
+
+
+# --- Legacy File Diagnostics Compatibility Helpers (used until downstream chunks) ---
+
+def row_day(entry: dict) -> Optional[str]:
+    ts_str = entry.get("ts")
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.astimezone(config.TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return ts_str[:10]
+
+
+def row_timestamp(entry: dict) -> float:
+    ts_str = entry.get("ts")
+    if not ts_str:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def get_all_log_files() -> List[str]:
+    found = []
+    for root, _, files in os.walk(config.LOGS_DIR):
+        if "incidents" in root:
+            continue
+        for f in files:
+            if f.endswith(".jsonl") or (f.startswith("diagnostics") and not f.endswith(".tmp") and not f.endswith(".json")):
+                found.append(os.path.join(root, f))
+    return sorted(found)
+
+
+def read_day_rows(day_str: str) -> list[dict]:
+    # Reads legacy jsonl rows or returns empty list
+    all_files = get_all_log_files()
+    rows = []
+    for path in all_files:
+        if day_str in os.path.basename(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if stripped := line.strip():
+                            try:
+                                rows.append(json.loads(stripped))
+                            except ValueError:
+                                continue
+            except OSError:
+                continue
+    return rows
+
+
+def get_rolling_rpm(rows: list[dict], now: float) -> int:
+    cutoff = now - 60.0
+    return sum(1 for r in rows if row_timestamp(r) >= cutoff)
