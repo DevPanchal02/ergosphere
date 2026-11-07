@@ -5,29 +5,57 @@ import json
 import asyncio
 from typing import Optional, Set
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, HTMLResponse
 import litellm
 
 import config
+import db
 import analytics
 import dashboard
 from controller import controller
 from key_manager import key_manager
 
+# Suppress verbose debug output from LiteLLM
 litellm.suppress_debug_info = True
 
-app = FastAPI(title="Horizon Proxy")
-
+# Active SSE client subscriber queues
 _sse_subscribers: Set[asyncio.Queue] = set()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initializes SQLite engine, restores fleet quarantine state, and preloads today's spend
+    await db.init_db()
+    await key_manager.init_fleet_state()
+    controller.preload_spend()
+    config.log.info("Horizon Proxy core services initialized")
+    yield
+    # Cleanly close database connections on shutdown
+    await db.close_db()
+    config.log.info("Horizon Proxy shut down cleanly")
+
+
+app = FastAPI(title="Horizon Proxy", lifespan=lifespan)
+
+
 async def broadcast_live_event(event_type: str, row: Optional[dict] = None):
+    # Pushes real-time status and telemetry events to connected cockpit dashboard clients
     if not _sse_subscribers:
         return
     now = time.time()
-    rows = analytics.read_day_rows(controller.get_today_str(now))
+    today_str = controller.get_today_str(now)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff_iso = datetime.fromtimestamp(now - 60.0, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Fast indexed SQL count for active RPM
+    try:
+        active_rpm = await db.get_rolling_rpm(today_str, cutoff_iso)
+    except Exception:
+        active_rpm = 0
+
     payload = {
         "type": event_type,
         "row": row,
@@ -36,9 +64,9 @@ async def broadcast_live_event(event_type: str, row: Optional[dict] = None):
             "day_usd": round(controller.ledger["day_usd"], 4),
             "daily_cap": controller.daily_cap,
             "run_usd": round(controller.ledger["run_usd"], 4),
-            "run_cap": controller.run_cap
+            "run_cap": controller.run_cap,
         },
-        "active_rpm": analytics.get_rolling_rpm(rows, now)
+        "active_rpm": active_rpm,
     }
     dead = set()
     for q in list(_sse_subscribers):
@@ -50,6 +78,7 @@ async def broadcast_live_event(event_type: str, row: Optional[dict] = None):
 
 
 def estimate_tokens(body: dict) -> int:
+    # Estimates input prompt tokens for pre-flight TPM reservations
     msgs = body.get("messages") or []
     try:
         return litellm.token_counter(model=config.PRIMARY_GEMINI_MODEL, messages=msgs)
@@ -62,11 +91,15 @@ def estimate_tokens(body: dict) -> int:
 
 
 def now_iso() -> str:
+    # Returns current UTC time formatted as standard ISO 8601 string
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# --- Management & Control API Routes ---
+
 @app.get("/health")
 async def health():
+    # Reports proxy health, active key status, and current spend cap posture
     now = time.time()
     healthy_count = sum(1 for q in key_manager.quarantined if not q)
 
@@ -83,13 +116,14 @@ async def health():
         "tpm_available": pool["pool_tpm_available"],
         "openrouter_configured": bool(config.OPENROUTER_KEY),
         "spend_capped": spend_blocked,
-        "spend_today_usd": round(controller.ledger["day_usd"], 4)
+        "spend_today_usd": round(controller.ledger["day_usd"], 4),
     })
 
 
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
+    # Returns available model identifiers in standard OpenAI format
     model_ids = list(config.OPENROUTER_ROUTES.keys()) + ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
     return {
         "object": "list",
@@ -99,6 +133,7 @@ async def list_models():
 
 @app.post("/api/key/fallback")
 async def set_key_fallback_route(request: Request):
+    # Toggles Gemini 3.1 fallback routing for a specific key
     body = await request.json()
     key_label = body.get("key")
     fallback = bool(body.get("fallback", False))
@@ -109,6 +144,7 @@ async def set_key_fallback_route(request: Request):
 
 @app.post("/api/key/unquarantine")
 async def unquarantine_key_route(request: Request):
+    # Revives a quarantined key in memory and persists change to SQLite
     body = await request.json()
     key_label = body.get("key")
     key_manager.unquarantine_key(key_label)
@@ -118,12 +154,13 @@ async def unquarantine_key_route(request: Request):
 
 @app.post("/api/limits")
 async def update_key_limits_route(request: Request):
+    # Dynamically updates rate limiting and concurrency parameters
     body = await request.json()
     key_manager.update_limits(
         rpm=body.get("rpm"),
         tpm=body.get("tpm"),
         rpd=body.get("rpd"),
-        max_parallel=body.get("max_parallel")
+        max_parallel=body.get("max_parallel"),
     )
     await broadcast_live_event("heartbeat")
     return {"status": "ok", "limits": key_manager.get_pool_status(time.time())["limits"]}
@@ -131,6 +168,7 @@ async def update_key_limits_route(request: Request):
 
 @app.post("/api/spend/limits")
 async def update_spend_limits_route(request: Request):
+    # Updates daily and per-run spend limits in memory and SQLite spend_state
     body = await request.json()
     daily_usd = float(body.get("daily_usd", controller.daily_cap))
     run_usd = float(body.get("run_usd", controller.run_cap))
@@ -141,6 +179,7 @@ async def update_spend_limits_route(request: Request):
 
 @app.get("/api/live")
 async def sse_live_feed(request: Request):
+    # Real-time Server-Sent Events stream powering the cockpit dashboard
     queue = asyncio.Queue(maxsize=100)
     _sse_subscribers.add(queue)
 
@@ -154,9 +193,9 @@ async def sse_live_feed(request: Request):
                     "day_usd": round(controller.ledger["day_usd"], 4),
                     "daily_cap": controller.daily_cap,
                     "run_usd": round(controller.ledger["run_usd"], 4),
-                    "run_cap": controller.run_cap
+                    "run_cap": controller.run_cap,
                 },
-                "active_rpm": 0
+                "active_rpm": 0,
             }
             yield f"data: {json.dumps(init_payload)}\n\n"
 
@@ -168,7 +207,12 @@ async def sse_live_feed(request: Request):
                     yield f"data: {json.dumps(msg)}\n\n"
                 except asyncio.TimeoutError:
                     now = time.time()
-                    rows = analytics.read_day_rows(controller.get_today_str(now))
+                    cutoff_iso = datetime.fromtimestamp(now - 60.0, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    try:
+                        active_rpm = await db.get_rolling_rpm(controller.ledger["day"], cutoff_iso)
+                    except Exception:
+                        active_rpm = 0
+
                     hb = {
                         "type": "heartbeat",
                         "pool": key_manager.get_pool_status(now),
@@ -176,9 +220,9 @@ async def sse_live_feed(request: Request):
                             "day_usd": round(controller.ledger["day_usd"], 4),
                             "daily_cap": controller.daily_cap,
                             "run_usd": round(controller.ledger["run_usd"], 4),
-                            "run_cap": controller.run_cap
+                            "run_cap": controller.run_cap,
                         },
-                        "active_rpm": analytics.get_rolling_rpm(rows, now)
+                        "active_rpm": active_rpm,
                     }
                     yield f"data: {json.dumps(hb)}\n\n"
         except (asyncio.CancelledError, GeneratorExit):
@@ -189,12 +233,19 @@ async def sse_live_feed(request: Request):
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
+# --- Core Ingress Dispatch Endpoint ---
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # Enforce Master Key authentication if configured in environment
+    auth_header = request.headers.get("authorization", "")
+    if config.MASTER_KEY and not analytics.verify_master_key(auth_header):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing Master Key")
+
     try:
         body = await request.json()
     except Exception:
@@ -202,31 +253,38 @@ async def chat_completions(request: Request):
 
     model = body.get("model")
     rid = uuid.uuid4().hex[:6]
-    t0 = time.time()
+    t0 = time.perf_counter()
     is_stream = bool(body.get("stream", False))
     key_label = "-"
     target_backend_model = model
 
+    # Ingress identity ladder: detect caller role, project directory, and operating system
     client_host = request.client.host if request.client else "unknown"
     caller_type, caller_dir, caller_os = analytics.detect_caller_and_os(
         dict(request.headers), body, client_host
+    )
+    session_id, turn_index, tokens_by_role = analytics.derive_request_context(
+        dict(request.headers), body
     )
 
     tool_names = sorted({(t.get("function") or {}).get("name", "?") for t in (body.get("tools") or []) if isinstance(t, dict)})
     tools_in_count = len(body.get("tools") or [])
 
     config.log.info(
-        "[%s] -> %s stream=%s caller=[%s | %s | %s] msgs=%d tools=%d",
+        "[%s] -> %s stream=%s caller=[%s | %s | %s] session=%s turn=%d msgs=%d tools=%d",
         rid, model, is_stream, caller_type, caller_os, caller_dir,
-        len(body.get("messages") or []), tools_in_count
+        session_id[:8], turn_index, len(body.get("messages") or []), tools_in_count,
     )
 
     gemini_key_label = None
     gemini_reserved = 0
     gemini_recorded = False
     gate_held = False
+    gate_wait_s = 0.0
+    pace_wait_s = 0.0
 
     def finish_gemini(actual_tokens: Optional[int] = None):
+        # Releases gate semaphore and updates key manager token reservations
         nonlocal gemini_recorded, gate_held
         if gate_held:
             gate_held = False
@@ -238,7 +296,7 @@ async def chat_completions(request: Request):
             else:
                 key_manager.release_reservation(gemini_key_label, gemini_reserved)
 
-    # Route 1: OpenRouter
+    # Route 1: OpenRouter (Paid models with spend cap verification)
     if model in config.OPENROUTER_ROUTES:
         rejection = controller.check_spend(time.time())
         if rejection:
@@ -259,7 +317,7 @@ async def chat_completions(request: Request):
         if effort_val:
             body.setdefault("extra_body", {}).setdefault("reasoning", {"effort": effort_val})
 
-    # Route 2: Gemini
+    # Route 2: Gemini Fleet (Free tier with concurrency gate)
     elif model in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
         msgs = body.get("messages") or []
         while msgs and msgs[-1].get("role") in ("assistant", "model"):
@@ -271,7 +329,10 @@ async def chat_completions(request: Request):
                 break
         body["messages"] = msgs
 
+        # Concurrency gate timer
+        t_gate_start = time.perf_counter()
         await key_manager.acquire_gate()
+        gate_wait_s = round(time.perf_counter() - t_gate_start, 3)
         gate_held = True
 
     else:
@@ -285,26 +346,29 @@ async def chat_completions(request: Request):
     excluded_keys = set()
     response = None
 
-    for _ in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         if model in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
             gemini_reserved = estimate_tokens(body)
             try:
-                key_label, key, pace_wait, use_fallback = await key_manager.acquire_key(
+                key_label, key, pace_wait_s, use_fallback = await key_manager.acquire_key(
                     estimated_tokens=gemini_reserved, excluded_keys=excluded_keys
                 )
             except RuntimeError as ex:
                 finish_gemini()
                 err_msg = str(ex)
-                duration = round(time.time() - t0, 2)
-                diag_row = {
-                    "ts": now_iso(), "rid": rid, "m": model,
-                    "caller": caller_type, "dir": caller_dir, "os": caller_os,
-                    "key": "DEAD", "status": 503, "dur": duration, "in": 0, "c_in": 0,
-                    "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
-                    "tools_called": [], "err": err_msg
+                duration = round(time.perf_counter() - t0, 3)
+                telemetry_row = {
+                    "ts": now_iso(), "day": controller.ledger["day"], "rid": rid,
+                    "session_id": session_id, "turn_index": turn_index,
+                    "caller_type": caller_type, "caller_dir": caller_dir, "caller_os": caller_os,
+                    "client_host": client_host, "model_requested": model, "model_dispatched": target_backend_model,
+                    "is_stream": int(is_stream), "key_label": "DEAD", "key_attempts": attempt,
+                    "duration_total_s": duration, "gate_wait_s": gate_wait_s, "pacing_wait_s": pace_wait_s,
+                    "status_code": 503, "error_message": err_msg, "tokens_by_role": tokens_by_role,
+                    "tools_in_count": tools_in_count, "tool_names_provided": tool_names,
                 }
-                analytics.log_diagnostic(diag_row)
-                asyncio.create_task(broadcast_live_event("telemetry", diag_row))
+                await db.insert_request(telemetry_row)
+                asyncio.create_task(broadcast_live_event("telemetry", telemetry_row))
                 return JSONResponse(status_code=503, content={"error": {"message": err_msg, "type": "FleetExhausted"}})
 
             gemini_key_label = key_label
@@ -329,21 +393,25 @@ async def chat_completions(request: Request):
             is_dead_key = (status_code in (401, 403) or "401" in err_msg or "403" in err_msg or "API_KEY_INVALID" in err_msg)
 
             if is_dead_key and model.startswith("gemini"):
-                duration = round(time.time() - t0, 2)
+                duration = round(time.perf_counter() - t0, 3)
                 config.log.warning("[%s] Gemini key %s failed (%s). Quarantining and retrying...", rid, key_label, status_code)
                 key_manager.quarantine_key(key_label, clean_err)
                 key_manager.record_error(key_label)
                 excluded_keys.add(key_label)
 
-                diag_row = {
-                    "ts": now_iso(), "rid": rid, "m": model,
-                    "caller": caller_type, "dir": caller_dir, "os": caller_os,
-                    "key": key_label, "status": status_code, "dur": duration, "in": 0, "c_in": 0,
-                    "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
-                    "tools_called": [], "err": f"Key {key_label} quarantined: {clean_err}"
+                telemetry_row = {
+                    "ts": now_iso(), "day": controller.ledger["day"], "rid": rid,
+                    "session_id": session_id, "turn_index": turn_index,
+                    "caller_type": caller_type, "caller_dir": caller_dir, "caller_os": caller_os,
+                    "client_host": client_host, "model_requested": model, "model_dispatched": target_backend_model,
+                    "is_stream": int(is_stream), "key_label": key_label, "key_attempts": attempt,
+                    "key_quarantined": 1, "quarantine_reason": clean_err,
+                    "duration_total_s": duration, "gate_wait_s": gate_wait_s, "pacing_wait_s": pace_wait_s,
+                    "status_code": status_code, "error_message": f"Key {key_label} quarantined: {clean_err}",
+                    "tokens_by_role": tokens_by_role, "tools_in_count": tools_in_count, "tool_names_provided": tool_names,
                 }
-                analytics.log_diagnostic(diag_row)
-                asyncio.create_task(broadcast_live_event("telemetry", diag_row))
+                await db.insert_request(telemetry_row)
+                asyncio.create_task(broadcast_live_event("telemetry", telemetry_row))
 
                 if gemini_key_label:
                     key_manager.release_reservation(gemini_key_label, gemini_reserved)
@@ -353,50 +421,63 @@ async def chat_completions(request: Request):
             if gemini_key_label:
                 key_manager.record_error(gemini_key_label)
             finish_gemini()
-            duration = round(time.time() - t0, 2)
+            duration = round(time.perf_counter() - t0, 3)
 
-            config.log.error("[%s] !! %s key=%s status=%s %s | %.1fs | %s",
+            config.log.error("[%s] !! %s key=%s status=%s %s | %.2fs | %s",
                              rid, model, key_label, status_code, type(e).__name__, duration, clean_err)
 
-            diag_row = {
-                "ts": now_iso(), "rid": rid, "m": model,
-                "caller": caller_type, "dir": caller_dir, "os": caller_os,
-                "key": key_label, "status": status_code, "dur": duration, "in": 0, "c_in": 0,
-                "out": 0, "r_out": 0, "cost": 0.0, "tools_in": tools_in_count, "tool_names": tool_names,
-                "tools_called": [], "err": clean_err
+            telemetry_row = {
+                "ts": now_iso(), "day": controller.ledger["day"], "rid": rid,
+                "session_id": session_id, "turn_index": turn_index,
+                "caller_type": caller_type, "caller_dir": caller_dir, "caller_os": caller_os,
+                "client_host": client_host, "model_requested": model, "model_dispatched": target_backend_model,
+                "is_stream": int(is_stream), "key_label": key_label, "key_attempts": attempt,
+                "duration_total_s": duration, "gate_wait_s": gate_wait_s, "pacing_wait_s": pace_wait_s,
+                "status_code": status_code, "error_message": clean_err,
+                "tokens_by_role": tokens_by_role, "tools_in_count": tools_in_count, "tool_names_provided": tool_names,
             }
-            analytics.log_diagnostic(diag_row)
-            asyncio.create_task(broadcast_live_event("telemetry", diag_row))
+            await db.insert_request(telemetry_row)
+            asyncio.create_task(broadcast_live_event("telemetry", telemetry_row))
             return JSONResponse(status_code=status_code, content={"error": {"message": clean_err, "type": type(e).__name__}})
 
     if response is None:
         finish_gemini()
         raise HTTPException(status_code=503, detail="All healthy Gemini keys failed.")
 
-    # Streaming completion
+    # --- Streaming Response Handling ---
     if is_stream:
         async def event_generator():
             usage = None
             called_tools = set()
             first_token_time = None
+            accumulated_content = []
+            finish_reason = "stop"
+
             try:
                 async for chunk in response:
                     if first_token_time is None:
-                        first_token_time = time.time() - t0
+                        first_token_time = round(time.perf_counter() - t0, 3)
                     choices = getattr(chunk, "choices", None)
                     if choices:
-                        delta = getattr(choices[0], "delta", None)
-                        for tc in getattr(delta, "tool_calls", None) or []:
-                            fn = getattr(tc, "function", None)
-                            if fn and (name := getattr(fn, "name", None)):
-                                called_tools.add(name)
+                        choice = choices[0]
+                        if fr := getattr(choice, "finish_reason", None):
+                            finish_reason = fr
+                        delta = getattr(choice, "delta", None)
+                        if delta:
+                            if c := getattr(delta, "content", None):
+                                accumulated_content.append(c)
+                            for tc in getattr(delta, "tool_calls", None) or []:
+                                fn = getattr(tc, "function", None)
+                                if fn and (name := getattr(fn, "name", None)):
+                                    called_tools.add(name)
 
                     if u := getattr(chunk, "usage", None):
                         usage = u
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
 
-                total_time = round(time.time() - t0, 2)
+                total_time = round(time.perf_counter() - t0, 3)
+                ttft_s = first_token_time or total_time
                 diag = analytics.parse_usage_and_cost(usage, target_backend_model)
                 finish_gemini(diag["in"] + diag["out"])
 
@@ -404,39 +485,82 @@ async def chat_completions(request: Request):
                     controller.record_cost(diag["cost"], time.time())
 
                 tool_list = sorted(called_tools)
+                active_gen_time = max(0.001, total_time - ttft_s)
+                tps = round(diag["out"] / active_gen_time, 1) if diag["out"] > 0 else 0.0
+
                 config.log.info(
-                    "[%s] <- 200 stream %s key=%s cost=$%.5f in=%d (c=%d) out=%d (r=%d) called=%s total=%.1fs",
+                    "[%s] <- 200 stream %s key=%s cost=$%.5f in=%d (c=%d) out=%d (r=%d) tps=%.1f called=%s total=%.2fs",
                     rid, model, key_label, diag["cost"], diag["in"], diag["c_in"],
-                    diag["out"], diag["r_out"], tool_list, total_time
+                    diag["out"], diag["r_out"], tps, tool_list, total_time
                 )
 
-                diag_row = {
-                    "ts": now_iso(), "rid": rid, "m": model,
-                    "caller": caller_type, "dir": caller_dir, "os": caller_os,
-                    "key": key_label, "status": 200, "dur": total_time, "ttft": round(first_token_time or 0.0, 2),
-                    "tools_in": tools_in_count, "tool_names": tool_names, "tools_called": tool_list,
-                    **diag, "err": None
+                telemetry_row = {
+                    "ts": now_iso(), "day": controller.ledger["day"], "rid": rid,
+                    "session_id": session_id, "turn_index": turn_index,
+                    "caller_type": caller_type, "caller_dir": caller_dir, "caller_os": caller_os,
+                    "client_host": client_host, "model_requested": model, "model_dispatched": target_backend_model,
+                    "is_stream": 1, "key_label": key_label, "duration_total_s": total_time,
+                    "gate_wait_s": gate_wait_s, "pacing_wait_s": pace_wait_s, "ttft_s": ttft_s,
+                    "tokens_per_second": tps, "status_code": 200, "finish_reason": finish_reason,
+                    "client_aborted": 0, "error_message": None,
+                    "tokens_prompt_total": diag["in"], "tokens_prompt_cached": diag["c_in"],
+                    "tokens_prompt_uncached": max(0, diag["in"] - diag["c_in"]),
+                    "tokens_completion": diag["out"], "tokens_reasoning": diag["r_out"],
+                    "tokens_by_role": tokens_by_role, "tools_in_count": tools_in_count,
+                    "tool_names_provided": tool_names, "tools_called": tool_list,
+                    "cost_usd": diag["cost"], "spend_accum_day_usd": controller.ledger["day_usd"],
+                    "spend_accum_run_usd": controller.ledger["run_usd"],
                 }
-                analytics.log_diagnostic(diag_row)
-                asyncio.create_task(broadcast_live_event("telemetry", diag_row))
-                analytics.capture_incident_payload(rid, diag["cost"], diag["in"], {"body": body, "usage": diag})
+                await db.insert_request(telemetry_row)
+                asyncio.create_task(broadcast_live_event("telemetry", telemetry_row))
+
+                # Check incident blackbox capture thresholds
+                if diag["cost"] >= config.HIGH_COST_THRESHOLD_USD or diag["in"] >= config.HIGH_TOKEN_THRESHOLD:
+                    await db.save_incident(rid, diag["cost"], diag["in"], {
+                        "headers": {k: config.scrub(v) for k, v in request.headers.items()},
+                        "body": body,
+                        "response": {"content": "".join(accumulated_content), "tools": tool_list},
+                        "usage": diag,
+                        "cost_breakdown": config.PRICING.get(target_backend_model, (0, 0, 0)),
+                    })
 
             except (asyncio.CancelledError, GeneratorExit):
-                config.log.warning("[%s] client disconnected mid-stream %s after %.1fs", rid, model, round(time.time() - t0, 2))
-                raise
-            except Exception as e:
-                clean_err = analytics.clean_error_message(str(e))
-                config.log.error("[%s] !! stream error %s %s | %s", rid, model, type(e).__name__, clean_err)
+                # 499: Client disconnected or cancelled stream mid-generation
+                total_time = round(time.perf_counter() - t0, 3)
+                config.log.warning("[%s] 499 Client disconnected mid-stream %s after %.2fs", rid, model, total_time)
+                diag = analytics.parse_usage_and_cost(usage, target_backend_model)
+
+                abort_row = {
+                    "ts": now_iso(), "day": controller.ledger["day"], "rid": rid,
+                    "session_id": session_id, "turn_index": turn_index,
+                    "caller_type": caller_type, "caller_dir": caller_dir, "caller_os": caller_os,
+                    "client_host": client_host, "model_requested": model, "model_dispatched": target_backend_model,
+                    "is_stream": 1, "key_label": key_label, "duration_total_s": total_time,
+                    "gate_wait_s": gate_wait_s, "pacing_wait_s": pace_wait_s,
+                    "ttft_s": first_token_time or total_time, "status_code": 499,
+                    "finish_reason": "cancelled", "client_aborted": 1,
+                    "error_message": "Client disconnected mid-stream",
+                    "tokens_prompt_total": diag["in"], "tokens_prompt_cached": diag["c_in"],
+                    "tokens_completion": diag["out"], "tokens_reasoning": diag["r_out"],
+                    "tokens_by_role": tokens_by_role, "tools_in_count": tools_in_count,
+                    "tool_names_provided": tool_names, "tools_called": sorted(called_tools),
+                    "cost_usd": diag["cost"],
+                }
+                try:
+                    await db.insert_request(abort_row)
+                    asyncio.create_task(broadcast_live_event("telemetry", abort_row))
+                except Exception:
+                    pass
                 raise
             finally:
                 finish_gemini()
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    # Non-streaming completion
+    # --- Non-Streaming Response Handling ---
     try:
         data = response.model_dump()
-        total_time = round(time.time() - t0, 2)
+        total_time = round(time.perf_counter() - t0, 3)
         diag = analytics.parse_usage_and_cost(data.get("usage"), target_backend_model)
         finish_gemini(diag["in"] + diag["out"])
 
@@ -444,47 +568,82 @@ async def chat_completions(request: Request):
             controller.record_cost(diag["cost"], time.time())
 
         called_tools = []
+        finish_reason = "stop"
         choices = data.get("choices") or []
         if choices:
-            msg = choices[0].get("message") or {}
-            called_tools = [tc.get("function", {}).get("name") for tc in msg.get("tool_calls") or [] if tc.get("function", {}).get("name")]
+            choice = choices[0]
+            finish_reason = choice.get("finish_reason") or "stop"
+            msg = choice.get("message") or {}
+            called_tools = [
+                tc.get("function", {}).get("name")
+                for tc in msg.get("tool_calls") or []
+                if tc.get("function", {}).get("name")
+            ]
+
+        active_gen_time = max(0.001, total_time)
+        tps = round(diag["out"] / active_gen_time, 1) if diag["out"] > 0 else 0.0
 
         config.log.info(
-            "[%s] <- 200 %s key=%s cost=$%.5f in=%d (c=%d) out=%d (r=%d) called=%s total=%.1fs",
+            "[%s] <- 200 %s key=%s cost=$%.5f in=%d (c=%d) out=%d (r=%d) called=%s total=%.2fs",
             rid, model, key_label, diag["cost"], diag["in"], diag["c_in"],
             diag["out"], diag["r_out"], called_tools, total_time
         )
 
-        diag_row = {
-            "ts": now_iso(), "rid": rid, "m": model,
-            "caller": caller_type, "dir": caller_dir, "os": caller_os,
-            "key": key_label, "status": 200, "dur": total_time, "ttft": total_time,
-            "tools_in": tools_in_count, "tool_names": tool_names, "tools_called": called_tools,
-            **diag, "err": None
+        telemetry_row = {
+            "ts": now_iso(), "day": controller.ledger["day"], "rid": rid,
+            "session_id": session_id, "turn_index": turn_index,
+            "caller_type": caller_type, "caller_dir": caller_dir, "caller_os": caller_os,
+            "client_host": client_host, "model_requested": model, "model_dispatched": target_backend_model,
+            "is_stream": 0, "key_label": key_label, "duration_total_s": total_time,
+            "gate_wait_s": gate_wait_s, "pacing_wait_s": pace_wait_s, "ttft_s": total_time,
+            "tokens_per_second": tps, "status_code": 200, "finish_reason": finish_reason,
+            "client_aborted": 0, "error_message": None,
+            "tokens_prompt_total": diag["in"], "tokens_prompt_cached": diag["c_in"],
+            "tokens_prompt_uncached": max(0, diag["in"] - diag["c_in"]),
+            "tokens_completion": diag["out"], "tokens_reasoning": diag["r_out"],
+            "tokens_by_role": tokens_by_role, "tools_in_count": tools_in_count,
+            "tool_names_provided": tool_names, "tools_called": called_tools,
+            "cost_usd": diag["cost"], "spend_accum_day_usd": controller.ledger["day_usd"],
+            "spend_accum_run_usd": controller.ledger["run_usd"],
         }
-        analytics.log_diagnostic(diag_row)
-        asyncio.create_task(broadcast_live_event("telemetry", diag_row))
-        analytics.capture_incident_payload(rid, diag["cost"], diag["in"], {"body": body, "response": data})
+        await db.insert_request(telemetry_row)
+        asyncio.create_task(broadcast_live_event("telemetry", telemetry_row))
+
+        if diag["cost"] >= config.HIGH_COST_THRESHOLD_USD or diag["in"] >= config.HIGH_TOKEN_THRESHOLD:
+            await db.save_incident(rid, diag["cost"], diag["in"], {
+                "headers": {k: config.scrub(v) for k, v in request.headers.items()},
+                "body": body,
+                "response": data,
+                "usage": diag,
+                "cost_breakdown": config.PRICING.get(target_backend_model, (0, 0, 0)),
+            })
 
         return JSONResponse(content=data)
     finally:
         finish_gemini()
 
 
+# --- Dashboard Views ---
+
 @app.get("/")
 @app.get("/usage")
 async def dashboard_view(request: Request, day: Optional[str] = None):
+    # Renders CLI text or HTML cockpit dashboard, supporting both sync and async renderers
     fmt = request.query_params.get("fmt")
     target_day = day or controller.get_today_str(time.time())
 
     user_agent = request.headers.get("user-agent", "").lower()
     if fmt == "text" or ("curl" in user_agent and fmt != "html"):
-        return PlainTextResponse(dashboard.render_cli_text(target_day))
+        cli_res = dashboard.render_cli_text(target_day)
+        if asyncio.iscoroutine(cli_res):
+            cli_res = await cli_res
+        return PlainTextResponse(cli_res)
 
     if fmt == "json":
-        rows = analytics.read_day_rows(target_day)
+        rows = await db.get_day_requests(target_day)
         by_model, by_caller, by_agent, ranked_tools = analytics.summarize_rows(rows)
-        available_days = [item["day"] for item in dashboard.get_available_log_days()]
+        day_entries = await db.get_available_days()
+        available_days = [item["day"] for item in day_entries]
         return {
             "day": target_day,
             "tz": config.TZ_NOTE,
@@ -495,21 +654,25 @@ async def dashboard_view(request: Request, day: Optional[str] = None):
                 "day_usd": round(controller.ledger["day_usd"], 4),
                 "daily_cap": controller.daily_cap,
                 "run_usd": round(controller.ledger["run_usd"], 4),
-                "run_cap": controller.run_cap
+                "run_cap": controller.run_cap,
             },
             "by_model": by_model,
             "by_caller": by_caller,
             "by_agent": by_agent,
             "tool_calls_ranked": ranked_tools,
             "top_tools": ranked_tools,
-            "pool": key_manager.get_pool_status(time.time())
+            "pool": key_manager.get_pool_status(time.time()),
         }
 
-    return HTMLResponse(dashboard.render_html_dashboard(target_day))
+    html_res = dashboard.render_html_dashboard(target_day)
+    if asyncio.iscoroutine(html_res):
+        html_res = await html_res
+    return HTMLResponse(html_res)
 
 
 @app.get("/status")
 async def system_status():
+    # Lightweight health and budget inspection endpoint
     now = time.time()
     return {
         "pool": key_manager.get_pool_status(now),
@@ -518,8 +681,8 @@ async def system_status():
             "day_usd": round(controller.ledger["day_usd"], 4),
             "daily_cap": controller.daily_cap,
             "run_usd": round(controller.ledger["run_usd"], 4),
-            "run_cap": controller.run_cap
-        }
+            "run_cap": controller.run_cap,
+        },
     }
 
 

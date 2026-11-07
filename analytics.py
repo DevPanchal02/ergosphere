@@ -405,7 +405,7 @@ def summarize_rows(rows: list[dict]):
     return dict(by_model), dict(by_caller), dict(by_agent), ranked_tools
 
 
-# --- Legacy File Diagnostics Compatibility Helpers (used until downstream chunks) ---
+# --- Legacy File Diagnostics Compatibility Helpers (used until Chunk 5 completes) ---
 
 def row_day(entry: dict) -> Optional[str]:
     ts_str = entry.get("ts")
@@ -438,6 +438,24 @@ def get_all_log_files() -> List[str]:
             if f.endswith(".jsonl") or (f.startswith("diagnostics") and not f.endswith(".tmp") and not f.endswith(".json")):
                 found.append(os.path.join(root, f))
     return sorted(found)
+
+
+def get_all_rows_cached() -> List[dict]:
+    """Legacy compatibility helper returning parsed log rows from disk."""
+    rows = []
+    for path in get_all_log_files():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if stripped := line.strip():
+                        try:
+                            rows.append(json.loads(stripped))
+                        except ValueError:
+                            continue
+        except OSError:
+            continue
+    rows.sort(key=lambda r: r.get("ts", ""))
+    return rows
 
 
 def read_day_rows(day_str: str) -> list[dict]:
